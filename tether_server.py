@@ -94,16 +94,20 @@ def _is_ack_message(content):
         pass
     return False, "", ""
 
-def _forward_reply(target_ip, reply_text):
-    """将 worker 处理后的回复自动转发回发件方的 Tether 服务器"""
+def _forward_reply(target_ip, reply_text, is_auto=True):
+    """将 worker 处理后的回复自动转发回发件方的 Tether 服务器
+    is_auto=True  → sender=HOSTNAME-auto（ACK/模板回复 → guard 丢弃）
+    is_auto=False → sender=HOSTNAME（实际输出 → guard 放行）
+    """
     if not target_ip or not reply_text:
         return False
     # 本地消息不转发（防止回环）
     if target_ip == TAILSCALE_IP:
         return False
     url = f"http://{target_ip}:{_own_tether_port}/message"
+    sender = HOSTNAME + ("-auto" if is_auto else "")
     payload = json.dumps({
-        "from": HOSTNAME + "-auto",
+        "from": sender,
         "message": reply_text[:2000],
     }).encode()
     headers = {"Content-Type": "application/json"}
@@ -170,7 +174,7 @@ def _process_message_worker():
                         summary = f"{len(output)} chars" if has_output else "无输出"
                         print(f"[tether] ✅ 消息 {msg_id[:8]} 处理完成 ({summary})")
                         if has_output and reply_to_addr:
-                            _forward_reply(reply_to_addr, output.strip())
+                            _forward_reply(reply_to_addr, output.strip(), is_auto=False)
                         break
                     else:
                         err = result.get("stderr", "") or result.get("error", "unknown")
@@ -257,7 +261,7 @@ def _process_fallback(msg_id, sender, content, reply_to_addr):
             capture_output=True, text=True, timeout=300
         )
         if r.returncode == 0 and r.stdout.strip() and reply_to_addr:
-            _forward_reply(reply_to_addr, r.stdout.strip())
+            _forward_reply(reply_to_addr, r.stdout.strip(), is_auto=False)
             print(f"[tether] ✅ 回退处理成功 ({len(r.stdout)} chars)")
         else:
             print(f"[tether] ⚠️ 回退处理完成但无输出或失败")
