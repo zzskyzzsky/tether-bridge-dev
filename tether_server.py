@@ -119,10 +119,63 @@ def _mark_message_requires_owner(sender, content):
 
 
 def _report_batch_complete(count, need_owner):
-    """队列清空时输出处理摘要"""
+    """队列清空时输出处理摘要，有需关注消息时推送到主群"""
     print(f"[tether] 队列已清空，本轮处理 {count} 条消息" + ("，有待处理内容" if need_owner else "，全部静默处理完成"))
     if need_owner:
-        print(f"[tether] 有 {count} 条消息需要关注，请在下次与主人交流时主动汇报")
+        print(f"[tether] 有 {count} 条消息需要关注，推送通知到主群")
+        _notify_owner_via_gateway(f"收到来自对方 {count} 条消息，已处理完毕")
+
+
+def _notify_owner_via_gateway(summary):
+    """通过 Gateway 会话推送通知到主人主群（事件驱动，无轮询）
+
+    当 Tether worker 批次清空且有待关注消息时触发，
+    Gateway 会话的 agent 使用 send_message 工具推送到钉钉主群。
+    同时也写 NOTIFY_FILE，供 agent 自检（Layer 1 兜底）。
+    """
+    # 双保险：始终写 NOTIFY_FILE（供 agent 自检和 inotify 监控）
+    _write_notify_file("batch", "tether", f"批次处理完毕: {summary}", 0)
+
+    if not GATEWAY_API_KEY:
+        print(f"[tether] ⚠️ 无法推送主通知：Gateway API Key 未设置，已写 NOTIFY_FILE")
+        return
+
+    notify_session = "tether-notify"
+    headers = {"Content-Type": "application/json"}
+    if GATEWAY_API_KEY:
+        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY}"
+
+    # 确保通知 session 存在
+    try:
+        url = f"{GATEWAY_API_URL}/api/sessions"
+        payload = json.dumps({"title": notify_session, "id": notify_session}).encode()
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError:
+        pass  # session 已存在，正常
+    except Exception as e:
+        print(f"[tether] ⚠️ 通知 session 创建失败: {str(e)[:60]}")
+        return
+
+    prompt = (
+        "[System Notification] Tether 批次处理完成，有消息需要主人关注。\n"
+        f"摘要：{summary}\n\n"
+        "=== 请执行以下操作 ===\n"
+        "1. 使用 send_message 工具向钉钉主人群发送一条通知\n"
+        f"2. 通知内容：「[Tether] 收到来自 MacBook 的消息，请检查 Tether 状态」\n"
+        "3. 发送完毕后回复 'done'\n\n"
+        "注意：这是系统通知，不需要分析或处理消息内容。"
+    )
+    try:
+        chat_url = f"{GATEWAY_API_URL}/api/sessions/{notify_session}/chat"
+        payload2 = json.dumps({"message": prompt}).encode()
+        req = urllib.request.Request(chat_url, data=payload2, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode())
+        content = result.get("message", {}).get("content", "")
+        print(f"[tether] ✅ 主通知已推送 (Gateway 回复: {content[:60]})")
+    except Exception as e:
+        print(f"[tether] ⚠️ 主通知推送失败: {str(e)[:100]}")
 
 
 def _forward_reply(target_ip, reply_text, is_auto=True):
