@@ -255,6 +255,15 @@ def _process_fallback(msg_id, sender, content, reply_to_addr):
         f"3) 如果是通知需要主人知道，请在下次与主人交流时提及"
     )
 
+    # v3: 优先走 Gateway API
+    gateway_output, gateway_err = _gateway_chat(prompt, timeout=300)
+    if gateway_err is None and gateway_output is not None:
+        if gateway_output and reply_to_addr:
+            _forward_reply(reply_to_addr, gateway_output, is_auto=False)
+            print(f"[tether] ✅ 回退处理(Gateway)成功 ({len(gateway_output)} chars)")
+        return
+
+    print(f"[tether] ⚡ 回退 Gateway 失败 ({gateway_err}), 尝试子进程")
     try:
         r = subprocess.run(
             [hermes_cmd, "-z", prompt],
@@ -268,14 +277,86 @@ def _process_fallback(msg_id, sender, content, reply_to_addr):
     except Exception as e:
         print(f"[tether] ❌ 回退处理异常: {e}")
 
+def _replay_queue():
+    """启动时扫描 SQLite 中未处理的持久化消息，重新入队。
+
+    解决重启后 PriorityQueue（内存队列）丢失，但 SQLite 中有 orphan 消息的问题。
+    """
+    count = 0
+    try:
+        with _get_db() as conn:
+            rows = conn.execute(
+                "SELECT id, sender, message, received_at FROM messages WHERE acked=0 ORDER BY received_at ASC"
+            ).fetchall()
+        for row in rows:
+            msg_id, sender, content, received_at = row
+            # 尝试从 persisted message 还原 reply_to_addr（从结构化消息提取）
+            reply_to_addr = None
+            try:
+                parsed = json.loads(content) if isinstance(content, str) and content.startswith("{") else {}
+                if isinstance(parsed, dict):
+                    reply_to_addr = parsed.get("sender_ip")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            global _queue_counter
+            _queue_counter += 1
+            _message_queue.put((1, _queue_counter, {
+                "id": msg_id,
+                "sender": sender,
+                "message": content,
+                "reply_to_addr": reply_to_addr,
+            }))
+            count += 1
+        if count:
+            print(f"[tether] ♻️ 重放 {count} 条持久化消息到处理队列")
+    except Exception as e:
+        print(f"[tether] ⚠️ 队列重放失败: {e}")
+
+
+# Worker 健康监控
+_WORKER_WATCHDOG = None
+_WATCHDOG_STOP = threading.Event()
+
+
+def _watchdog_loop():
+    """监控 worker 健康：如果队列中有消息但长时间无变动，标记异常并尝试恢复。"""
+    last_processed = 0
+    stall_count = 0
+    while not _WATCHDOG_STOP.is_set():
+        qsize = _message_queue.qsize()
+        global _queue_counter
+        current = _queue_counter
+        if qsize > 0 and current == last_processed:
+            stall_count += 1
+            if stall_count >= 12:  # ~60秒无进展
+                print(f"[tether] 🚨 Worker 可能卡死（队列 {qsize} 项，{stall_count * 5}s 无进展），尝试重启")
+                _WATCHDOG_STOP.set()
+                _start_worker()
+                return
+        else:
+            stall_count = 0
+        last_processed = current
+        _WATCHDOG_STOP.wait(timeout=5)
+
+
 def _start_worker():
-    """启动消息处理 worker 线程"""
-    global _worker_thread
+    """启动消息处理 worker 线程 + 队列重放 + 健康监控"""
+    global _worker_thread, _WORKER_WATCHDOG, _WATCHDOG_STOP
     if _worker_thread is not None and _worker_thread.is_alive():
         print("[tether] worker 线程已在运行")
         return
+
+    # 启动时重放持久化消息（修复重启丢队列问题）
+    _replay_queue()
+
+    _WATCHDOG_STOP = threading.Event()
     _worker_thread = threading.Thread(target=_process_message_worker, daemon=True)
     _worker_thread.start()
+
+    # 启动健康监控
+    _WORKER_WATCHDOG = threading.Thread(target=_watchdog_loop, daemon=True)
+    _WORKER_WATCHDOG.start()
+    print("[tether] worker + 健康监控已启动")
 
 # ===== SQLite 持久化 =====
 def _get_db():
@@ -593,18 +674,30 @@ def process_message():
     )
     
     try:
+        # v3: 优先走 Gateway API（复用 session，保持 prefix cache）
+        gateway_output, gateway_err = _gateway_chat(prompt, timeout=timeout)
+        if gateway_err is None and gateway_output is not None:
+            print(f"[tether] ✅ /api/process 通过 Gateway API 完成 ({len(gateway_output)} chars)")
+            return jsonify({
+                "status": "ok" if gateway_output else "error",
+                "output": gateway_output,
+                "gateway": True,
+            })
+        # Gateway 不可用，回退到子进程
+        print(f"[tether] ⚡ /api/process 回退到子进程 (Gateway: {gateway_err})")
         r = subprocess.run(
             [hermes_cmd, "-z", prompt],
             capture_output=True, text=True, timeout=timeout
         )
         output = r.stdout.strip()
         stderr_short = r.stderr[:500] if r.stderr else ""
-        print(f"[tether] ✅ /api/process 处理完成 ({len(output)} chars, exit={r.returncode})")
+        print(f"[tether] ✅ /api/process 子进程完成 ({len(output)} chars, exit={r.returncode})")
         return jsonify({
             "status": "ok" if r.returncode == 0 else "error",
             "output": output,
             "stderr": stderr_short,
             "exit_code": r.returncode,
+            "gateway": False,
         })
     except subprocess.TimeoutExpired:
         print(f"[tether] ⏰ /api/process 超时 ({timeout}s)")
@@ -628,6 +721,61 @@ def _find_hermes_cli():
         elif os.path.isfile(candidate):
             return candidate
     return None
+
+# ===== Gateway API Server 客户端 (v3) =====
+# 替代直接调 hermes CLI 子进程，复用 session 保持 prefix cache
+GATEWAY_API_URL = "http://127.0.0.1:8642"
+GATEWAY_SESSION_ID = "tether-bridge"
+GATEWAY_API_KEY = ""  # 从环境变量读取
+
+def _gateway_chat(message, timeout=300):
+    """通过 Gateway API Server 处理消息，返回 (output, error) 二元组"""
+    url = f"{GATEWAY_API_URL}/api/sessions/{GATEWAY_SESSION_ID}/chat"
+    payload = json.dumps({"message": message}).encode()
+    headers = {"Content-Type": "application/json"}
+    if GATEWAY_API_KEY:
+        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY}"
+
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode())
+            content = result.get("message", {}).get("content", "")
+            return content.strip(), None
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            err_msg = str(e)
+            if attempt == 0:
+                print(f"[tether] ⚠️ Gateway API 请求失败 (attempt 1): {err_msg[:100]}")
+                continue
+            return None, err_msg
+        except Exception as e:
+            return None, str(e)
+    return None, "Gateway API 请求失败（重试耗尽）"
+
+def _ensure_gateway_session():
+    """确保 tether-bridge session 存在，不存在则创建"""
+    url = f"{GATEWAY_API_URL}/api/sessions"
+    payload = json.dumps({"title": GATEWAY_SESSION_ID, "id": GATEWAY_SESSION_ID}).encode()
+    headers = {"Content-Type": "application/json"}
+    if GATEWAY_API_KEY:
+        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY}"
+
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            print(f"[tether] ✅ Gateway session 已创建: {result.get('session', {}).get('id', GATEWAY_SESSION_ID)}")
+            return True
+    except urllib.error.HTTPError as e:
+        if e.code == 409:  # session 已存在
+            print(f"[tether] ✅ Gateway session 已存在: {GATEWAY_SESSION_ID}")
+            return True
+        print(f"[tether] ⚠️ Gateway session 创建失败 (HTTP {e.code}): {str(e)[:100]}")
+        return False
+    except Exception as e:
+        print(f"[tether] ⚠️ Gateway 不可达，将使用子进程回退: {str(e)[:100]}")
+        return False
 
 # ===== 内部 =====
 def _now_iso():
@@ -693,7 +841,29 @@ def main():
     _own_tether_port = LISTEN_PORT
     _own_auth_token = AUTH_TOKEN
 
+    # 从 .env 文件读取 Gateway API Server key（如果环境变量中不存在）
+    # 优先环境变量，再从 ~/.hermes/.env 加载
+    global GATEWAY_API_KEY
+    GATEWAY_API_KEY = os.environ.get("API_SERVER_KEY", "")
+    if not GATEWAY_API_KEY:
+        _env_path = os.path.expanduser("~/.hermes/.env")
+        if os.path.isfile(_env_path):
+            try:
+                with open(_env_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("API_SERVER_KEY="):
+                            GATEWAY_API_KEY = line.split("=", 1)[1]
+                            break
+            except Exception as e:
+                print(f"[tether] ⚠️ 读取 .env 失败: {e}")
+    if GATEWAY_API_KEY:
+        print(f"[tether] Gateway API key 已加载 ({len(GATEWAY_API_KEY)} chars)")
+
     _init_db()
+
+    # 确保 Gateway session 存在（启动时创建，保持 prefix cache）
+    _ensure_gateway_session()
 
     # 统一绑定 0.0.0.0（跨实例兼容）
     bind_addr = "0.0.0.0"
