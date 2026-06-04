@@ -420,7 +420,9 @@ def receive_message():
         if reply:
             # 存 SQLite + 直接转发回复（不进 worker 队列）
             _save_incoming(msg_id, sender, content, _now_iso())
-            _write_notify_file(msg_id, sender, content, _count_pending())
+            # 纯 ACK 心跳不进 notify.json，避免 inflight counter 虚高
+            if payload_type != "ack":
+                _write_notify_file(msg_id, sender, content, _count_pending())
             print(f"[tether] ⚡ 快速 ACK from={sender} template={ack_template}: {reply[:50]}")
             if effective_reply_to:
                 _forward_reply(effective_reply_to, reply)
