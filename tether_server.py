@@ -24,12 +24,43 @@ _use_gateway = True  # 默认启用 Gateway，tp 用 --no-gateway 关闭
 
 # ===== 通知文件机制 (Phase 5) =====
 # 收到消息时写一个 flag 文件到 /tmp/，便于本地客户端/inotify 感知新消息，
-# 替代纯 API 轮询。客户端可用 inotifywait -m /tmp/tether_notify.json 监听。
 NOTIFY_FILE = "/tmp/tether_notify.json"
+_UNREAD_FILE = "/tmp/tether_unread.json"
+
 
 def _write_notify_file(msg_id, sender, message_preview, pending_count):
-    """写通知 flag 文件：包含最新消息摘要和待处理数量"""
+    """写通知 flag 文件：包含最新消息摘要和待处理数量
+    
+    同时维护累积未读列表（_UNREAD_FILE），供 Layer 1 自检查看所有历史。
+    """
     import json as _json
+    
+    # === 累积未读日志（所有非ACK消息） ===
+    try:
+        existing = []
+        if os.path.isfile(_UNREAD_FILE):
+            with open(_UNREAD_FILE) as f:
+                existing = _json.load(f)
+        if not isinstance(existing, list):
+            existing = []
+    except Exception:
+        existing = []
+    entry = {
+        "time": _now_iso(),
+        "message_id": msg_id[:12],
+        "sender": sender,
+        "preview": message_preview[:80],
+    }
+    existing.append(entry)
+    # 保留最近 50 条，防止无限膨胀
+    existing = existing[-50:]
+    try:
+        with open(_UNREAD_FILE, "w") as f:
+            _json.dump(existing, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[tether] ⚠️ 未读日志写入失败: {e}")
+
+    # === 最新消息预览（覆盖写入） ===
     try:
         data = {
             "new_messages": True,
@@ -38,6 +69,7 @@ def _write_notify_file(msg_id, sender, message_preview, pending_count):
             "sender": sender,
             "preview": message_preview[:80],
             "pending_count": pending_count,
+            "unread_file": _UNREAD_FILE,
         }
         with open(NOTIFY_FILE, "w") as f:
             _json.dump(data, f)
