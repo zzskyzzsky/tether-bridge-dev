@@ -142,8 +142,9 @@ def _notify_owner_via_gateway(summary):
 
     notify_session = "tether-notify"
     headers = {"Content-Type": "application/json"}
-    if GATEWAY_API_KEY:
-        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY}"
+    key = GATEWAY_API_KEY.strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
 
     # 确保通知 session 存在
     try:
@@ -861,7 +862,7 @@ def _gateway_chat(message, timeout=300):
     payload = json.dumps({"message": message}).encode()
     headers = {"Content-Type": "application/json"}
     if GATEWAY_API_KEY:
-        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY}"
+        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY.strip()}"
 
     for attempt in range(2):
         try:
@@ -886,7 +887,7 @@ def _ensure_gateway_session():
     payload = json.dumps({"title": GATEWAY_SESSION_ID, "id": GATEWAY_SESSION_ID}).encode()
     headers = {"Content-Type": "application/json"}
     if GATEWAY_API_KEY:
-        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY}"
+        headers["Authorization"] = f"Bearer {GATEWAY_API_KEY.strip()}"
 
     try:
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
@@ -992,7 +993,7 @@ def main():
                     for line in f:
                         line = line.strip()
                         if line.startswith("API_SERVER_KEY="):
-                            GATEWAY_API_KEY = line.split("=", 1)[1]
+                            GATEWAY_API_KEY = line.split("=", 1)[1].strip()
                             break
             except Exception as e:
                 print(f"[tether] ⚠️ 读取 .env 失败: {e}")
