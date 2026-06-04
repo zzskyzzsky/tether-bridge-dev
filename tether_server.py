@@ -168,6 +168,7 @@ def _process_message_worker():
                     has_output = bool(gateway_output.strip())
                     summary = f"{len(gateway_output)} chars" if has_output else "无输出"
                     print(f"[tether] ✅ 消息 {msg_id[:8]} 处理完成 (Gateway, {summary})")
+                    _ack_incoming(msg_id)
                     if has_output and reply_to_addr:
                         _forward_reply(reply_to_addr, gateway_output.strip(), is_auto=False)
                 else:
@@ -246,6 +247,7 @@ def _process_fallback(msg_id, sender, content, reply_to_addr):
             if gateway_output and reply_to_addr:
                 _forward_reply(reply_to_addr, gateway_output, is_auto=False)
                 print(f"[tether] ✅ 回退处理(Gateway)成功 ({len(gateway_output)} chars)")
+            _ack_incoming(msg_id)
             return
         print(f"[tether] ⚡ 回退 Gateway 失败 ({gateway_err}), 尝试子进程")
 
@@ -260,8 +262,10 @@ def _process_fallback(msg_id, sender, content, reply_to_addr):
             print(f"[tether] ✅ 回退处理成功 ({len(r.stdout)} chars)")
         else:
             print(f"[tether] ⚠️ 回退处理完成但无输出或失败")
+        _ack_incoming(msg_id)
     except Exception as e:
         print(f"[tether] ❌ 回退处理异常: {e}")
+        _ack_incoming(msg_id)  # 即使异常，也标记为已处理，避免重放
 
 def _replay_queue():
     """启动时扫描 SQLite 中未处理的持久化消息，重新入队。
@@ -395,6 +399,11 @@ def _ack_outgoing(msg_id):
     with _get_db() as conn:
         conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (msg_id,))
 
+def _ack_incoming(msg_id):
+    """标记收到的消息已处理完毕，避免重启后 _replay_queue 重放"""
+    with _get_db() as conn:
+        conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
+
 def _count_pending_outgoing():
     with _get_db() as conn:
         return conn.execute("SELECT COUNT(*) FROM outgoing_messages WHERE acked=0").fetchone()[0]
@@ -496,7 +505,8 @@ def receive_message():
             return jsonify({"status": "ok", "message_id": msg_id, "fast_ack": True, "reply": reply})
         # 模板未知 → 降级到普通队列处理
 
-    # 1. 存 SQLite（持久化保障）
+    # 1. 存 SQLite（持久化保障）并标记 已确认
+    #    先保存（acked=0），入队后立即标记 acked=1，防止此消息被 _replay_queue 重放
     _save_incoming(msg_id, sender, content, _now_iso())
     _write_notify_file(msg_id, sender, content, _count_pending())
     print(f"[tether] 收到消息 from={sender} addr={effective_reply_to} priority={priority}: {content[:80]}")
@@ -510,6 +520,10 @@ def receive_message():
         "message": content,
         "reply_to_addr": effective_reply_to,
     }))
+
+    # 3. 标记已确认：worker 已接手，重启不必重放
+    with _get_db() as conn:
+        conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
     
     return jsonify({"status": "ok", "message_id": msg_id})
 

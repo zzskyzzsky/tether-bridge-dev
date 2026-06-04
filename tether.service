@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=zzsky
-ExecStart=/home/zzsky/.hermes/tether/tether_server.py --port 9001 --no-gateway
+ExecStart=/home/zzsky/.hermes/tether/tether_server.py --port 9001 --gateway
 Restart=always
 RestartSec=5
 Environment=TETHER_TOKEN=6c84e624e6cae2b760b4d4ed7bd7f2f8
