@@ -4,6 +4,7 @@ Tether Bridge v2 — Hermes 实例间通信服务
 SQLite 持久化 + ACK 确认机制，重启不丢消息
 
 v2.2: 串行队列 + 自动回复转发 — worker 处理完自动将输出 POST 回发件方
+v2.3: --gateway / --no-gateway 参数区分实例，mac 走 Gateway API Server 加速
 """
 import json, os, socket, sqlite3, subprocess, threading, time, uuid, argparse
 import urllib.request, urllib.error
@@ -19,6 +20,7 @@ TAILSCALE_IP = None
 LISTEN_PORT = 9001
 AUTH_TOKEN = None  # 从环境变量或参数读取
 DB_PATH = None
+_use_gateway = True  # 默认启用 Gateway，tp 用 --no-gateway 关闭
 
 # ===== 通知文件机制 (Phase 5) =====
 # 收到消息时写一个 flag 文件到 /tmp/，便于本地客户端/inotify 感知新消息，
@@ -146,59 +148,41 @@ def _process_message_worker():
             
             print(f"[tether] ▶ 处理消息 {msg_id[:8]} from={sender}: {content[:60]}")
             
-            # 方案6：HTTP POST 到本地 /api/process（替代直接调子进程）
-            # 后续可升级为走 Gateway（不调子进程）
-            process_url = f"http://127.0.0.1:{LISTEN_PORT}/api/process"
-            payload = json.dumps({
-                "sender": sender,
-                "message": content,
-                "timeout": 300,
-            }).encode()
-            headers = {"Content-Type": "application/json"}
-            if AUTH_TOKEN:
-                headers["X-Tether-Token"] = AUTH_TOKEN
-            
-            for attempt in range(2):
-                try:
-                    req = urllib.request.Request(
-                        process_url, data=payload, headers=headers, method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=300) as resp:
-                        result = json.loads(resp.read().decode())
-                    
-                    status = result.get("status", "error")
-                    output = result.get("output", "")
-                    
-                    if status == "ok":
-                        has_output = bool(output.strip())
-                        summary = f"{len(output)} chars" if has_output else "无输出"
-                        print(f"[tether] ✅ 消息 {msg_id[:8]} 处理完成 ({summary})")
-                        if has_output and reply_to_addr:
-                            _forward_reply(reply_to_addr, output.strip(), is_auto=False)
-                        break
-                    else:
-                        err = result.get("stderr", "") or result.get("error", "unknown")
-                        print(f"[tether] ⚠️ 消息 {msg_id[:8]} 处理异常 (attempt {attempt+1}): {err[:200]}")
-                        if attempt == 1:
-                            # 回退策略：直接调子进程
-                            print(f"[tether] ⚡ 回退：直接调 hermes CLI 子进程")
-                            _process_fallback(msg_id, sender, content, reply_to_addr)
-                except (urllib.error.URLError, urllib.error.HTTPError) as e:
-                    print(f"[tether] ⚠️ 消息 {msg_id[:8]} HTTP 失败 (attempt {attempt+1}): {e}")
-                    if attempt == 1:
-                        print(f"[tether] ⚡ 回退：直接调 hermes CLI 子进程")
-                        _process_fallback(msg_id, sender, content, reply_to_addr)
-                except Exception as e:
-                    print(f"[tether] 💥 消息 {msg_id[:8]} 异常: {e}")
-                    if attempt == 1:
-                        _process_fallback(msg_id, sender, content, reply_to_addr)
-                    break
+            if _use_gateway:
+                # v4: 走 Gateway API（复用 session，保持 prefix cache）
+                prompt = (
+                    f"[Agent-to-Agent] 来自 {sender}（Tether 通信桥 - Gateway）[v2]：\n"
+                    f"{content}\n\n"
+                    f"=== 协议版本说明 ===\n"
+                    f"本消息协议版本: v2 | 我方支持: v2\n"
+                    f"如需回复对方，请在消息内容开头加版本标记\n"
+                    f"例如: v2|回复内容\n\n"
+                    f"这是另一台 Hermes agent 通过 Tether 发来的消息，不是普通聊天。\n"
+                    f"请根据内容判断需要做什么：\n"
+                    f"1) 如果需要执行任务，使用 terminal 等工具完成\n"
+                    f"2) 如果需要回复对方，直接输出回复内容，系统会自动转发\n"
+                    f"3) 如果是通知需要主人知道，请在下次与主人交流时提及"
+                )
+                gateway_output, gateway_err = _gateway_chat(prompt, timeout=300)
+                if gateway_err is None and gateway_output is not None:
+                    has_output = bool(gateway_output.strip())
+                    summary = f"{len(gateway_output)} chars" if has_output else "无输出"
+                    print(f"[tether] ✅ 消息 {msg_id[:8]} 处理完成 (Gateway, {summary})")
+                    if has_output and reply_to_addr:
+                        _forward_reply(reply_to_addr, gateway_output.strip(), is_auto=False)
+                else:
+                    print(f"[tether] ⚠️ 消息 {msg_id[:8]} Gateway 失败 ({gateway_err}), 尝试子进程回退")
+                    _process_fallback(msg_id, sender, content, reply_to_addr)
+            else:
+                # tp 模式：直接走子进程，不走 Gateway
+                print(f"[tether] ▶ 消息 {msg_id[:8]} 直接走子进程 (Gateway 未启用)")
+                _process_fallback(msg_id, sender, content, reply_to_addr)
                     
         except Exception as e:
             print(f"[tether] worker 循环异常: {e}")
 
 def _process_fallback(msg_id, sender, content, reply_to_addr):
-    """回退方案：直接调 hermes CLI 子进程（当 /api/process 不可用时）"""
+    """回退方案：直接调 hermes CLI 子进程（当 Gateway 不可用或未启用时）"""
     hermes_cmd = _find_hermes_cli()
     if not hermes_cmd:
         print(f"[tether] ❌ 回退失败：找不到 hermes CLI")
@@ -255,15 +239,17 @@ def _process_fallback(msg_id, sender, content, reply_to_addr):
         f"3) 如果是通知需要主人知道，请在下次与主人交流时提及"
     )
 
-    # v3: 优先走 Gateway API
-    gateway_output, gateway_err = _gateway_chat(prompt, timeout=300)
-    if gateway_err is None and gateway_output is not None:
-        if gateway_output and reply_to_addr:
-            _forward_reply(reply_to_addr, gateway_output, is_auto=False)
-            print(f"[tether] ✅ 回退处理(Gateway)成功 ({len(gateway_output)} chars)")
-        return
+    if _use_gateway:
+        # 先尝试 Gateway
+        gateway_output, gateway_err = _gateway_chat(prompt, timeout=300)
+        if gateway_err is None and gateway_output is not None:
+            if gateway_output and reply_to_addr:
+                _forward_reply(reply_to_addr, gateway_output, is_auto=False)
+                print(f"[tether] ✅ 回退处理(Gateway)成功 ({len(gateway_output)} chars)")
+            return
+        print(f"[tether] ⚡ 回退 Gateway 失败 ({gateway_err}), 尝试子进程")
 
-    print(f"[tether] ⚡ 回退 Gateway 失败 ({gateway_err}), 尝试子进程")
+    print(f"[tether] ⚡ 使用子进程 hermes -z 处理")
     try:
         r = subprocess.run(
             [hermes_cmd, "-z", prompt],
@@ -833,6 +819,10 @@ def main():
     parser.add_argument("--token", default=os.environ.get("TETHER_TOKEN"))
     parser.add_argument("--db", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db"))
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--gateway", action="store_true", default=None,
+                        help="启用 Gateway API Server 模式（mac 用）")
+    parser.add_argument("--no-gateway", action="store_true", default=None,
+                        help="禁用 Gateway API Server 模式（tp 用）")
     args = parser.parse_args()
 
     LISTEN_PORT = args.port
@@ -840,6 +830,14 @@ def main():
     DB_PATH = args.db
     _own_tether_port = LISTEN_PORT
     _own_auth_token = AUTH_TOKEN
+
+    # 解析 Gateway 模式
+    global _use_gateway
+    if args.no_gateway:
+        _use_gateway = False
+    elif args.gateway:
+        _use_gateway = True
+    # else: 保持默认值 (True)
 
     # 从 .env 文件读取 Gateway API Server key（如果环境变量中不存在）
     # 优先环境变量，再从 ~/.hermes/.env 加载
@@ -862,16 +860,21 @@ def main():
 
     _init_db()
 
-    # 确保 Gateway session 存在（启动时创建，保持 prefix cache）
-    _ensure_gateway_session()
+    # 确保 Gateway session 存在（仅 mac 模式）
+    if _use_gateway:
+        _ensure_gateway_session()
+    else:
+        print(f"[tether] Gateway 模式已禁用，直接使用子进程")
 
     # 统一绑定 0.0.0.0（跨实例兼容）
     bind_addr = "0.0.0.0"
 
-    print(f"🌉 Tether Bridge v2.2 — {HOSTNAME}")
+    print(f"🌉 Tether Bridge v2.3 — {HOSTNAME}")
     print(f"   监听: {bind_addr}:{LISTEN_PORT}")
     auth_status = "启用" if AUTH_TOKEN else "未设置"
     print(f"   认证: {auth_status}")
+    gw_mode = "启用 (Gateway API)" if _use_gateway else "禁用 (子进程)"
+    print(f"   消息处理模式: {gw_mode}")
     print(f"   数据库: {DB_PATH}")
     print(f"   实时消息处理: 已启用（串行队列 + 自动回复转发）")
 
