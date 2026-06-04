@@ -96,11 +96,36 @@ def _is_ack_message(content):
         pass
     return False, "", ""
 
+
+# ===== Worker 批次通知机制 (Layer 2) =====
+# 处理完一批消息（队列清空）后汇总摘要，标记是否需要主人知悉
+
+_batch_requires_owner = False
+
+
+def _mark_message_requires_owner(sender, content):
+    """检测消息是否需要告知主人。auto/ack 类静默忽略，真实消息标记。"""
+    global _batch_requires_owner
+    if sender.endswith("-auto"):
+        return
+    try:
+        parsed = json.loads(content) if isinstance(content, str) and content.strip().startswith("{") else {}
+        if isinstance(parsed, dict):
+            if parsed.get("type") in ("ack",) and parsed.get("llm") is False:
+                return
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    _batch_requires_owner = True
+
+
+def _report_batch_complete(count, need_owner):
+    """队列清空时输出处理摘要"""
+    print(f"[tether] 队列已清空，本轮处理 {count} 条消息" + ("，有待处理内容" if need_owner else "，全部静默处理完成"))
+    if need_owner:
+        print(f"[tether] 有 {count} 条消息需要关注，请在下次与主人交流时主动汇报")
+
+
 def _forward_reply(target_ip, reply_text, is_auto=True):
-    """将 worker 处理后的回复自动转发回发件方的 Tether 服务器
-    is_auto=True  → sender=HOSTNAME-auto（ACK/模板回复 → guard 丢弃）
-    is_auto=False → sender=HOSTNAME（实际输出 → guard 放行）
-    """
     if not target_ip or not reply_text:
         return False
     # 本地消息不转发（防止回环）
@@ -129,15 +154,29 @@ def _forward_reply(target_ip, reply_text, is_auto=True):
         return False
 
 def _process_message_worker():
-    """Worker 线程：从优先级队列取出消息，POST 到 /api/process 处理，串行执行"""
-    print(f"[tether] 消息处理 worker 已启动（方案6：HTTP POST /api/process，优先级队列）")
+    """Worker 线程：从优先级队列取出消息，串行处理。
+    
+    处理完一条后自动取下一条，直到队列清空。
+    清空后记录处理摘要，供后续通知使用。
+    """
+    print(f"[tether] 消息处理 worker 已启动（串行优先级队列，处理完一条自动取下一条）")
+    global _batch_requires_owner
+    batch_processed = 0
     
     while True:
         try:
             priority_num, _, msg_data = _message_queue.get()
             global _last_dequeue_time
             _last_dequeue_time = time.time()
+            # 重新有消息入队，累计当前批次
+            if msg_data is not None:
+                batch_processed += 1
         except Empty:
+            # 队列空：检查是否需要通知主人
+            if batch_processed > 0:
+                _report_batch_complete(batch_processed, _batch_requires_owner)
+                batch_processed = 0
+                _batch_requires_owner = False
             continue
         except Exception as e:
             print(f"[tether] worker 循环异常: {e}")
@@ -151,7 +190,11 @@ def _process_message_worker():
             sender = msg_data['sender']
             content = msg_data['message']
             reply_to_addr = msg_data.get('reply_to_addr')
-            
+
+            # 结构化消息处理：检测是否需要告知主人
+            # 1 = ACK/模板回复（静默），1 = 需要主人
+            _mark_message_requires_owner(sender, content)
+
             print(f"[tether] ▶ 处理消息 {msg_id[:8]} from={sender}: {content[:60]}")
             
             if _use_gateway:
@@ -339,6 +382,11 @@ def _start_worker():
         print("[tether] worker 线程已在运行")
         return
 
+    # 启动前先记录当前积压消息数，用于 Layer 2 启动检查
+    pending_count = _count_pending()
+    if pending_count > 0:
+        print(f"[tether] 启动检查：messages 表中有 {pending_count} 条待处理消息，_replay_queue 将重放")
+    
     # 启动时重放持久化消息（修复重启丢队列问题）
     _replay_queue()
 
