@@ -108,9 +108,13 @@ def _forward_reply(target_ip, reply_text, is_auto=True):
         return False
     url = f"http://{target_ip}:{_own_tether_port}/message"
     sender = HOSTNAME + ("-auto" if is_auto else "")
+    # 生成并持久化 outgoing msg_id，对方 ACK 时用到
+    outgoing_id = str(uuid.uuid4())
+    _save_outgoing(outgoing_id, target_ip, sender, reply_text[:2000], _now_iso())
     payload = json.dumps({
         "from": sender,
         "message": reply_text[:2000],
+        "msg_id": outgoing_id,  # 带上本机 outgoing_id 供对方回执 ACK
     }).encode()
     headers = {"Content-Type": "application/json"}
     if _own_auth_token:
@@ -131,6 +135,8 @@ def _process_message_worker():
     while True:
         try:
             priority_num, _, msg_data = _message_queue.get()
+            global _last_dequeue_time
+            _last_dequeue_time = time.time()
         except Empty:
             continue
         except Exception as e:
@@ -306,27 +312,24 @@ def _replay_queue():
 # Worker 健康监控
 _WORKER_WATCHDOG = None
 _WATCHDOG_STOP = threading.Event()
+_last_dequeue_time = time.time()
 
 
 def _watchdog_loop():
-    """监控 worker 健康：如果队列中有消息但长时间无变动，标记异常并尝试恢复。"""
-    last_processed = 0
-    stall_count = 0
+    """监控 worker 健康：如果队列中有消息但 worker 久未拉取新消息，尝试恢复。
+
+    使用 _last_dequeue_time 判断 worker 是否在正常处理（而非 _queue_counter，
+    因为计数器只在入队时增长，处理时不变）。
+    """
     while not _WATCHDOG_STOP.is_set():
         qsize = _message_queue.qsize()
-        global _queue_counter
-        current = _queue_counter
-        if qsize > 0 and current == last_processed:
-            stall_count += 1
-            if stall_count >= 12:  # ~60秒无进展
-                print(f"[tether] 🚨 Worker 可能卡死（队列 {qsize} 项，{stall_count * 5}s 无进展），尝试重启")
-                _WATCHDOG_STOP.set()
-                _start_worker()
-                return
-        else:
-            stall_count = 0
-        last_processed = current
-        _WATCHDOG_STOP.wait(timeout=5)
+        elapsed = time.time() - _last_dequeue_time
+        if qsize > 0 and elapsed > 120:  # 2分钟无新消息出队 → 可能卡死
+            print(f"[tether] 🚨 Worker 可能卡死（队列 {qsize} 项，{elapsed:.0f}s 无出队），重启 worker")
+            _WATCHDOG_STOP.set()
+            _start_worker()
+            return
+        _WATCHDOG_STOP.wait(timeout=10)
 
 
 def _start_worker():
@@ -404,6 +407,24 @@ def _ack_incoming(msg_id):
     with _get_db() as conn:
         conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
 
+
+def _send_ack(target_ip, remote_msg_id):
+    """向对方 Tether 服务器发送跨实例 ACK 确认消息已收到
+    
+    remote_msg_id: 对方消息的 outgoing msg_id（由 _forward_reply 时携带）
+    """
+    url = f"http://{target_ip}:{_own_tether_port}/ack"
+    body = json.dumps({"message_ids": [remote_msg_id]}).encode()
+    headers = {"Content-Type": "application/json"}
+    if _own_auth_token:
+        headers["X-Tether-Token"] = _own_auth_token
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        urllib.request.urlopen(req, timeout=5)
+        print(f"[tether] ✅ 跨实例 ACK 已发送到 {target_ip}:{_own_tether_port} (msg={remote_msg_id[:12]})")
+    except Exception as e:
+        print(f"[tether] ⚠️ 跨实例 ACK 失败: {e}")
+
 def _count_pending_outgoing():
     with _get_db() as conn:
         return conn.execute("SELECT COUNT(*) FROM outgoing_messages WHERE acked=0").fetchone()[0]
@@ -451,6 +472,7 @@ def receive_message():
     sender = data.get("from", "unknown")
     content = data.get("message", "")
     remote_addr = request.remote_addr or data.get("reply_to_ip")
+    sender_msg_id = data.get("msg_id")  # 发件方提供的 outgoing msg_id，用于回执 ACK
 
     # 静默丢弃空消息（如 Tether 回退通道的健康检查探针）
     if not content.strip():
@@ -524,6 +546,10 @@ def receive_message():
     # 3. 标记已确认：worker 已接手，重启不必重放
     with _get_db() as conn:
         conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
+    
+    # 4. 向发件方发回跨实例 ACK（如果对方传了 msg_id）
+    if effective_reply_to and sender_msg_id and not sender.endswith("-auto"):
+        _send_ack(effective_reply_to, sender_msg_id)
     
     return jsonify({"status": "ok", "message_id": msg_id})
 
