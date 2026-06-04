@@ -571,7 +571,7 @@ def receive_message():
     """
     data = request.get_json(silent=True) or {}
     msg_id = str(uuid.uuid4())
-    sender = data.get("from", "unknown")
+    sender = data.get("from") or data.get("sender", "unknown")
     content = data.get("message", "")
     remote_addr = request.remote_addr or data.get("reply_to_ip")
     sender_msg_id = data.get("msg_id")  # 发件方提供的 outgoing msg_id，用于回执 ACK
