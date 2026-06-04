@@ -162,10 +162,10 @@ def _notify_owner_via_gateway(summary):
         "[System Notification] Tether 批次处理完成，有消息需要主人关注。\n"
         f"摘要：{summary}\n\n"
         "=== 请执行以下操作 ===\n"
-        "1. 使用 send_message 工具向钉钉主人群发送一条通知\n"
-        f"2. 通知内容：「[Tether] 收到来自 {HOSTNAME} 的消息，请检查 Tether 状态」\n"
+        "1. 使用 send_message 工具发送一条钉钉通知到 home channel\n"
+        "2. 通知内容：「[Tether] 收到来自 MacBook 的消息，请检查 Tether 状态」\n"
         "3. 发送完毕后回复 'done'\n\n"
-        "注意：这是系统通知，不需要分析或处理消息内容。"
+        "注意：这是系统通知，请直接执行 send_message，不需要分析或处理消息内容。"
     )
     try:
         chat_url = f"{GATEWAY_API_URL}/api/sessions/{notify_session}/chat"
