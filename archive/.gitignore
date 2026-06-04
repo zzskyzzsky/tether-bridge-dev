@@ -1,0 +1,8 @@
+venv/
+*.pyc
+__pycache__/
+*.db
+tether.service
+setup_macbook.sh
+.git/
+*.db-*

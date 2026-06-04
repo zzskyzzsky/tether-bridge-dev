@@ -1,14 +1,15 @@
 [Unit]
-Description=Tether Server v3 — 极简消息中转
+Description=Tether Bridge — Hermes 实例间通信
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=zzsky
-ExecStart=/home/zzsky/.hermes/tether/tether_server.py --port 9001
+ExecStart=/home/zzsky/.hermes/tether/tether_server.py --port 9001 --gateway
 Restart=always
 RestartSec=5
+Environment=TETHER_TOKEN=6c84e624e6cae2b760b4d4ed7bd7f2f8
 StandardOutput=journal
 StandardError=journal
 

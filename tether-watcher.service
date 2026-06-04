@@ -1,0 +1,16 @@
+[Unit]
+Description=Tether Watcher — 2秒轮询处理消息
+After=tether.service
+BindsTo=tether.service
+
+[Service]
+Type=simple
+User=zzsky
+ExecStart=/home/zzsky/.hermes/tether/tether_watcher.py
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

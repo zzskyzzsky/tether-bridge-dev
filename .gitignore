@@ -1,8 +1,7 @@
 venv/
-*.pyc
 __pycache__/
+*.pyc
 *.db
-tether.service
-setup_macbook.sh
-.git/
-*.db-*
+tether.db-shm
+tether.db-wal
+.env
