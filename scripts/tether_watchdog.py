@@ -14,19 +14,48 @@ TETHER_TOKEN = os.environ.get("TETHER_TOKEN", "")
 NOTIFY_FILE = "/tmp/tether_notify.json"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
 API_SERVER_KEY = os.environ.get("API_SERVER_KEY", "")
-# 尝试从 .env 读取
-if not API_SERVER_KEY:
-    env_path = os.path.expanduser("~/.hermes/.env")
-    if os.path.isfile(env_path):
+
+# 从配置文件兜底读取（cron 环境下没有 systemd 传入的环境变量）
+def _read_config_value(key_prefix, file_paths):
+    """从多个配置文件读取值，返回第一个找到的值或 None"""
+    for fpath in file_paths:
+        fpath = os.path.expanduser(fpath)
+        if not os.path.isfile(fpath):
+            continue
         try:
-            with open(env_path) as f:
+            with open(fpath) as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith("API_SERVER_KEY="):
-                        API_SERVER_KEY = line.split("=", 1)[1].strip()
-                        break
+                    if line.startswith(key_prefix):
+                        return line.split("=", 1)[1].strip()
         except Exception:
             pass
+    return None
+
+if not TETHER_TOKEN:
+    # 先从 .env
+    val = _read_config_value("TETHER_TOKEN=", ["~/.hermes/tether/.env"])
+    if not val:
+        # 从 tether.service 读取（格式: Environment=TETHER_TOKEN=xxx）
+        svc = os.path.expanduser("~/.hermes/tether/tether.service")
+        if os.path.isfile(svc):
+            try:
+                with open(svc) as f:
+                    for line in f:
+                        if "Environment=TETHER_TOKEN=" in line:
+                            val = line.split("Environment=TETHER_TOKEN=", 1)[1].strip()
+                            break
+            except Exception:
+                pass
+    if val:
+        TETHER_TOKEN = val.split("\\n")[0].strip()
+
+if not API_SERVER_KEY:
+    val = _read_config_value("API_SERVER_KEY=", [
+        "~/.hermes/.env",
+    ])
+    if val:
+        API_SERVER_KEY = val
 HOSTNAME = os.popen("hostname").read().strip() or "unknown"
 STALE_THRESHOLD = 300  # 5 分钟
 
@@ -37,7 +66,7 @@ def log(msg):
     print(f"[watchdog] {msg}", flush=True)
 
 def check_status():
-    """查 Tether /status，返回 (has_pending, has_stale_unacked, detail)"""
+    """查 Tether /status，返回 (has_pending, has_stale, detail)"""
     url = f"http://{TETHER_HOST}:{TETHER_PORT}/status"
     headers = {}
     if TETHER_TOKEN:
@@ -49,7 +78,7 @@ def check_status():
             data = json.loads(resp.read())
     except Exception as e:
         log(f"Tether 状态查询失败: {e}")
-        return False, False, {"error": str(e)}
+        return False, False, {"pending": 0, "unacked": 0, "error": str(e)}
 
     pending = data.get("messages_pending", 0)
     unacked = data.get("messages_unacked_outgoing", 0)

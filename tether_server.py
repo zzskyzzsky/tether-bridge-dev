@@ -230,14 +230,20 @@ def _forward_reply(target_ip, reply_text, is_auto=True):
     headers = {"Content-Type": "application/json"}
     if _own_auth_token:
         headers["X-Tether-Token"] = _own_auth_token
-    try:
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        urllib.request.urlopen(req, timeout=10)
-        print(f"[tether] ✅ 自动转发回复到 {target_ip}:{_own_tether_port} ({len(reply_text)} chars)")
-        return True
-    except Exception as e:
-        print(f"[tether] ⚠️ 自动转发失败: {e}")
-        return False
+    # 2 次重试：初始 + 1 次重试
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            urllib.request.urlopen(req, timeout=10)
+            print(f"[tether] ✅ 自动转发回复到 {target_ip}:{_own_tether_port} ({len(reply_text)} chars)")
+            return True
+        except Exception as e:
+            if attempt == 0:
+                print(f"[tether] ⚠️ 自动转发失败 (retrying): {e}")
+                time.sleep(1)
+                continue
+            print(f"[tether] ⚠️ 自动转发失败: {e}")
+            return False
 
 def _process_message_worker():
     """Worker 线程：从优先级队列取出消息，串行处理。
@@ -375,17 +381,7 @@ def _process_fallback(msg_id, sender, content, reply_to_addr):
         f"3) 如果是通知需要主人知道，请在下次与主人交流时提及"
     )
 
-    if _use_gateway:
-        # 先尝试 Gateway
-        gateway_output, gateway_err = _gateway_chat(prompt, timeout=300)
-        if gateway_err is None and gateway_output is not None:
-            if gateway_output and reply_to_addr:
-                _forward_reply(reply_to_addr, gateway_output, is_auto=False)
-                print(f"[tether] ✅ 回退处理(Gateway)成功 ({len(gateway_output)} chars)")
-            _ack_incoming(msg_id)
-            return
-        print(f"[tether] ⚡ 回退 Gateway 失败 ({gateway_err}), 尝试子进程")
-
+    # 回退函数直接走子进程，不再重试 Gateway（worker 已试过）
     print(f"[tether] ⚡ 使用子进程 hermes -z 处理")
     try:
         r = subprocess.run(
@@ -907,6 +903,7 @@ def _gateway_chat(message, timeout=300):
             err_msg = str(e)
             if attempt == 0:
                 print(f"[tether] ⚠️ Gateway API 请求失败 (attempt 1): {err_msg[:100]}")
+                time.sleep(2)  # 短暂等待后重试
                 continue
             return None, err_msg
         except Exception as e:
