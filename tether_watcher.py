@@ -8,6 +8,10 @@ Tether Watcher — 事件驱动消息处理器
 """
 import json, os, subprocess, time, urllib.request
 
+# 设置本机请求绕过 HTTP 代理（MacBook 上可能配了 Clash 环境变量）
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
+
 NOTIFY_FILE = "/tmp/tether_notify.json"
 TETHER_URL = "http://127.0.0.1:9001"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
