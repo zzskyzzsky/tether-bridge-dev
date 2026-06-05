@@ -21,6 +21,7 @@ TETHER_URL = "http://127.0.0.1:9001"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
 GATEWAY_SESSION = "tether-watcher"
 GATEWAY_API_KEY = ""
+HANDOFF_RESULT_FILE = "/tmp/tether_handoff_result.json"
 POLL_INTERVAL = 2
 
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key
@@ -284,6 +285,17 @@ def process_messages():
     log("✅ 本轮处理完成")
 
 
+def _write_handoff_result(sender, summary, output):
+    """将 handoff 处理结果写入临时文件，供主 session 检测"""
+    try:
+        now = __import__("datetime").datetime.now().isoformat()
+        with open(HANDOFF_RESULT_FILE, "w") as f:
+            json.dump({"sender": sender, "summary": summary,
+                       "output": output, "time": now}, f)
+    except Exception:
+        pass
+
+
 def process_handoffs():
     """检查 handoff 文件，有内容就通过 hermes -z 处理（需要工具执行能力）
 
@@ -337,8 +349,11 @@ def process_handoffs():
                 [hermes, "-z", prompt],
                 capture_output=True, text=True, timeout=300
             )
-            if r.returncode == 0 and r.stdout.strip():
-                log(f"✅ Handoff 处理完成 ({len(r.stdout.strip())} chars)")
+            output = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else ""
+            if output:
+                log(f"✅ Handoff 处理完成 ({len(output)} chars)")
+                # 将处理摘要写入结果文件，供 Gateway session 读取
+                _write_handoff_result(sender, summary[:40], output[:500])
             else:
                 log(f"⚠️ Handoff 完成但无输出 (rc={r.returncode})")
         except subprocess.TimeoutExpired:
