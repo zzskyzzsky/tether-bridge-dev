@@ -421,6 +421,8 @@ def _recover_stale_handoffs():
                     "summary": message[:200],
                     "timestamp": __import__("datetime").datetime.now().isoformat(),
                 }, f)
+            # 只恢复第一条，后续靠子线程链式推进
+            break
     except Exception as e:
         log(f"handoff 恢复检查异常: {str(e)[:60]}")
 
