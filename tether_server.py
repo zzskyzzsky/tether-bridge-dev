@@ -2,7 +2,7 @@
 """
 Tether Server v3 — 极简消息中转
 只做三件事：收消息、存 SQLite、写通知文件。
-无 Worker 线程、无 Gateway 集成、无 ACK 协议、无模板系统。
+支持 type=handoff 消息：存 SQLite + 写 handoff 文件，但不触发 Watcher。
 """
 import json, os, socket, sqlite3, uuid
 from datetime import datetime, timezone
@@ -14,6 +14,7 @@ HOSTNAME = socket.gethostname()
 LISTEN_PORT = 9001
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 NOTIFY_FILE = "/tmp/tether_notify.json"
+HANDOFF_FILE = "/tmp/tether_handoff.json"
 
 def _db():
     conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -22,8 +23,14 @@ def _db():
     conn.execute("""CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, sender TEXT NOT NULL,
         message TEXT NOT NULL, received_at TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'info',
         acked INTEGER NOT NULL DEFAULT 0
     )""")
+    # 兼容旧表（v3 升级）
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN type TEXT NOT NULL DEFAULT 'info'")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""CREATE TABLE IF NOT EXISTS outgoing_messages (
         id TEXT PRIMARY KEY, target_host TEXT NOT NULL,
         sender TEXT NOT NULL, message TEXT NOT NULL,
@@ -65,25 +72,49 @@ def receive():
     data = request.get_json(silent=True) or {}
     sender = data.get("from") or data.get("sender", "unknown")
     content = data.get("message") or data.get("content", "")
+    msg_type = data.get("type", "info")
     if not content.strip():
         return jsonify({"status": "ok", "dropped": "empty"})
 
     msg_id = str(uuid.uuid4())
     with _db() as conn:
-        conn.execute("INSERT INTO messages VALUES (?,?,?,?,0)",
-                     (msg_id, sender, content, _now()))
-    with _db() as conn:
-        cnt = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0").fetchone()[0]
-    _write_notify(content, cnt)
+        conn.execute(
+            "INSERT INTO messages (id, sender, message, received_at, type, acked) VALUES (?,?,?,?,?,0)",
+            (msg_id, sender, content, _now(), msg_type))
+
+    if msg_type == "handoff":
+        # handoff：存 SQLite + 写 handoff 文件，不触发 Watcher notify
+        try:
+            with open(HANDOFF_FILE, "w") as f:
+                json.dump({
+                    "msg_id": msg_id,
+                    "sender": sender,
+                    "summary": content[:200],
+                    "timestamp": _now(),
+                }, f)
+        except Exception:
+            pass
+    else:
+        # info 消息：正常触发 Watcher
+        with _db() as conn:
+            cnt = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0 AND type='info'").fetchone()[0]
+        _write_notify(content, cnt)
     return jsonify({"status": "ok", "message_id": msg_id})
 
 @app.route("/messages", methods=["GET"])
 def get_messages():
     auto_ack = request.args.get("ack", "1") == "1"
+    msg_type = request.args.get("type", "info")  # 默认只返回 info 消息，传 all 返回全部
     with _db() as conn:
-        rows = conn.execute(
-            "SELECT id,sender,message,received_at FROM messages WHERE acked=0"
-        ).fetchall()
+        if msg_type == "all":
+            rows = conn.execute(
+                "SELECT id,sender,message,type,received_at FROM messages WHERE acked=0"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id,sender,message,type,received_at FROM messages WHERE acked=0 AND type=?",
+                (msg_type,)
+            ).fetchall()
         if auto_ack and rows:
             ids = [r["id"] for r in rows]
             conn.execute(f"UPDATE messages SET acked=1 WHERE id IN ({','.join('?' for _ in ids)})", ids)
