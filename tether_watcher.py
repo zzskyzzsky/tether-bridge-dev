@@ -143,13 +143,12 @@ def _restart_tether():
 
 
 def _self_heal():
-    """自愈巡检：Tether 和 Gateway 的健康检查 + 自动重启"""
-    # Gateway 自愈
+    """自愈巡检：Gateway 健康检查 + 自动重启（Tether 由 systemd Restart=always 管理）"""
     _ensure_gateway_alive()
-    # Tether 自愈
+    # 注意：不主动重启 tether.service — watcher 的 BindsTo=tether.service
+    # 会导致自愈重启 tether 时连带杀死自己，形成级联循环
     if not _tether_healthy():
-        log("⚠️ Tether 服务不可达，启动自愈...")
-        _restart_tether()
+        log("⚠️ Tether 不可达（由 systemd Restart=always 负责恢复）")
 
 
 def _tether_get(path):
