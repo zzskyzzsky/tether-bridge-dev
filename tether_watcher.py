@@ -9,7 +9,7 @@ Tether Watcher — 事件驱动消息处理器
 同时监控 /tmp/tether_handoff.json，发现 handoff 消息就通过 hermes -z
 子进程处理（handoff 需要完整的 agent session 来执行工具和回复）。
 """
-import json, os, subprocess, time, urllib.request
+import json, os, subprocess, threading, time, urllib.request
 
 # 设置本机请求绕过 HTTP 代理（MacBook 上可能配了 Clash 环境变量）
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
@@ -74,7 +74,11 @@ def _is_gateway_alive():
 
 
 def _ensure_gateway_alive():
-    """如果 Gateway 挂了，尝试自动重启 hermes-gateway.service"""
+    """如果 Gateway 挂了，尝试自动重启 hermes-gateway.service
+
+    包含重启防抖：连续两次重启间隔至少 30 秒，防止无限重启循环。
+    重启后等待 5 秒再检查，若未就绪再等两轮（最长 ~15 秒）。
+    """
     global _last_restart_time
 
     if _is_gateway_alive():
@@ -281,7 +285,11 @@ def process_messages():
 
 
 def process_handoffs():
-    """检查 handoff 文件，有内容就通过 hermes -z 处理（需要工具执行能力）"""
+    """检查 handoff 文件，有内容就通过 hermes -z 处理（需要工具执行能力）
+
+    通过子线程运行 hermes -z，不阻塞主循环（info 消息处理不受影响）。
+    处理完成后删除 handoff 文件而非写入 {}，避免每次轮询无效 IO。
+    """
     if not os.path.isfile(HANDOFF_FILE):
         return
 
@@ -294,9 +302,20 @@ def process_handoffs():
     sender = handoff.get("sender", "")
     summary = handoff.get("summary", "")
     if not sender or not summary:
+        # 空 handoff 文件，删掉避免重复 stat
+        try:
+            os.remove(HANDOFF_FILE)
+        except OSError:
+            pass
         return
 
     log(f"📋 发现 handoff from={sender}: {summary[:60]}...")
+
+    # 先删除 handoff 文件，防止重复处理
+    try:
+        os.remove(HANDOFF_FILE)
+    except OSError:
+        pass
 
     prompt = (
         f"[Tether Handoff] 来自 {sender} 的接力消息：\n{summary}\n\n"
@@ -311,26 +330,25 @@ def process_handoffs():
         log("❌ 找不到 hermes CLI，handoff 跳过")
         return
 
-    try:
-        r = subprocess.run(
-            [hermes, "-z", prompt],
-            capture_output=True, text=True, timeout=300
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            log(f"✅ Handoff 处理完成 ({len(r.stdout.strip())} chars)")
-        else:
-            log(f"⚠️ Handoff 完成但无输出 (rc={r.returncode})")
-    except subprocess.TimeoutExpired:
-        log(f"⏰ Handoff 超时 (300s)")
-    except Exception as e:
-        log(f"❌ Handoff 异常: {str(e)[:80]}")
+    # 子线程运行 hermes -z，不阻塞主循环
+    def _run_handoff():
+        try:
+            r = subprocess.run(
+                [hermes, "-z", prompt],
+                capture_output=True, text=True, timeout=300
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                log(f"✅ Handoff 处理完成 ({len(r.stdout.strip())} chars)")
+            else:
+                log(f"⚠️ Handoff 完成但无输出 (rc={r.returncode})")
+        except subprocess.TimeoutExpired:
+            log(f"⏰ Handoff 超时 (300s)")
+        except Exception as e:
+            log(f"❌ Handoff 异常: {str(e)[:80]}")
 
-    # 处理完成，清空 handoff 文件
-    try:
-        with open(HANDOFF_FILE, "w") as f:
-            json.dump({}, f)
-    except Exception:
-        pass
+    t = threading.Thread(target=_run_handoff, daemon=True)
+    t.start()
+    log("🔀 Handoff 已交给子线程处理，继续轮询")
 
 
 def main():

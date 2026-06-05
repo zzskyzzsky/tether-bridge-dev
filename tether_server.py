@@ -117,6 +117,7 @@ def get_messages():
                 (msg_type,)
             ).fetchall()
         if auto_ack and rows:
+            # 仅 ACK 当前查询范围内的消息（handoff 不会被 info 查询误 ACK）
             ids = [r["id"] for r in rows]
             conn.execute(f"UPDATE messages SET acked=1 WHERE id IN ({','.join('?' for _ in ids)})", ids)
     msgs = [dict(r) for r in rows]
