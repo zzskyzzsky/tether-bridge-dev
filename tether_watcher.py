@@ -319,6 +319,8 @@ def process_handoffs():
             os.remove(HANDOFF_FILE)
         except OSError:
             pass
+        # 检查 SQLite 中是否还有未处理的 handoff，有就恢复
+        _recover_next_handoff()
         return
 
     log(f"📋 发现 handoff from={sender}: {summary[:60]}...")
@@ -360,10 +362,67 @@ def process_handoffs():
             log(f"⏰ Handoff 超时 (300s)")
         except Exception as e:
             log(f"❌ Handoff 异常: {str(e)[:80]}")
+        # 处理完一条后尝试恢复下一条积压 handoff
+        _recover_next_handoff()
 
     t = threading.Thread(target=_run_handoff, daemon=True)
     t.start()
     log("🔀 Handoff 已交给子线程处理，继续轮询")
+
+
+def _recover_next_handoff():
+    """从 SQLite 中取下一个未处理的 handoff，写入 handoff 文件"""
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        if not os.path.isfile(db_path):
+            return
+        conn = sqlite3.connect(db_path, timeout=3)
+        row = conn.execute(
+            "SELECT id, sender, message FROM messages WHERE acked=0 AND type='handoff' LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return
+        msg_id, sender, message = row
+        log(f"♻️ 恢复下一条 handoff #{msg_id[:8]} from={sender}")
+        with open(HANDOFF_FILE, "w") as f:
+            json.dump({
+                "msg_id": msg_id,
+                "sender": sender,
+                "summary": message[:200],
+                "timestamp": __import__("datetime").datetime.now().isoformat(),
+            }, f)
+    except Exception as e:
+        log(f"handoff 恢复异常: {str(e)[:60]}")
+
+
+def _recover_stale_handoffs():
+    """启动时检查：SQLite 中是否有未处理的 handoff 消息，重新生成 handoff 文件"""
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        if not os.path.isfile(db_path):
+            return
+        conn = sqlite3.connect(db_path, timeout=3)
+        rows = conn.execute(
+            "SELECT id, sender, message FROM messages WHERE acked=0 AND type='handoff'"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return
+        for row in rows:
+            msg_id, sender, message = row
+            log(f"♻️ 发现未处理的 handoff #{msg_id[:8]} from={sender}，重新生成 handoff 文件")
+            with open(HANDOFF_FILE, "w") as f:
+                json.dump({
+                    "msg_id": msg_id,
+                    "sender": sender,
+                    "summary": message[:200],
+                    "timestamp": __import__("datetime").datetime.now().isoformat(),
+                }, f)
+    except Exception as e:
+        log(f"handoff 恢复检查异常: {str(e)[:60]}")
 
 
 def main():
@@ -371,6 +430,9 @@ def main():
     _ensure_gateway_alive()
 
     _ensure_gateway_session()
+
+    # 启动时恢复因 watcher 重启而残留的未处理 handoff
+    _recover_stale_handoffs()
 
     log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s, 自愈={_SELF_HEAL_INTERVAL}s)")
     last_mtime = 0
