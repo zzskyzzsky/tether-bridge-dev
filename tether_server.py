@@ -42,6 +42,10 @@ def _write_notify(preview, count):
     except Exception:
         pass
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "hostname": HOSTNAME}), 200
+
 @app.route("/ping", methods=["GET"])
 def ping():
     return jsonify({"pong": True, "hostname": HOSTNAME, "time": _now()})

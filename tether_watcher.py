@@ -32,13 +32,27 @@ else:
         except Exception:
             pass
 
+# 自愈相关
+_last_restart_time = 0.0
+_SELF_HEAL_INTERVAL = 15  # 每15秒检查一次 tether 健康
+
 
 def log(msg):
     print(f"[watcher] {msg}", flush=True)
 
 
+def _tether_healthy():
+    """检查本地 Tether 服务是否健康（HTTP GET /health → 200）"""
+    try:
+        req = urllib.request.Request(f"{TETHER_URL}/health")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 GATEWAY_PORT = 8642
-_last_restart_time = 0  # 重启防抖计时
+_last_restart_time = 0  # 重启防抖计时（同时用于 Gateway 和 Tether 的自愈）
 
 
 def _is_gateway_alive():
@@ -96,6 +110,46 @@ def _ensure_gateway_alive():
     except Exception as e:
         log(f"❌ Gateway 重启异常: {str(e)[:80]}")
         return False
+
+
+def _restart_tether():
+    """重启本地 tether.service，带防抖（<30s 跳过）"""
+    global _last_restart_time
+    now = time.time()
+    if now - _last_restart_time < 30:
+        log(f"⏭️ 重启跳过：距上次重启 {now - _last_restart_time:.0f}s < 30s")
+        return False
+    _last_restart_time = now
+    log("🔄 尝试重启 tether.service...")
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "restart", "tether.service"],
+            capture_output=True, text=True, timeout=10
+        )
+    except Exception as e:
+        log(f"❌ 重启命令失败: {e}")
+        return False
+
+    # 重启确认：先等5s，再等两轮5s（最长~15s）
+    for attempt in range(3):
+        if attempt > 0:
+            time.sleep(5)
+        if _tether_healthy():
+            log(f"✅ 重启成功（第{attempt+1}次检查后）")
+            return True
+        log(f"⏳ 等待 tether 恢复（第{attempt+1}次检查，未就绪）")
+    log("❌ 重启确认失败，tether 仍不可用")
+    return False
+
+
+def _self_heal():
+    """自愈巡检：Tether 和 Gateway 的健康检查 + 自动重启"""
+    # Gateway 自愈
+    _ensure_gateway_alive()
+    # Tether 自愈
+    if not _tether_healthy():
+        log("⚠️ Tether 服务不可达，启动自愈...")
+        _restart_tether()
 
 
 def _tether_get(path):
@@ -234,8 +288,9 @@ def main():
 
     _ensure_gateway_session()
 
-    log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s)")
+    log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s, 自愈={_SELF_HEAL_INTERVAL}s)")
     last_mtime = 0
+    last_heal_time = 0.0
 
     if not os.path.isfile(NOTIFY_FILE):
         try:
@@ -245,7 +300,9 @@ def main():
             pass
 
     while True:
+        now = time.time()
         try:
+            # 消息处理（notify 文件变化检测）
             if os.path.isfile(NOTIFY_FILE):
                 mtime = os.path.getmtime(NOTIFY_FILE)
                 if mtime > last_mtime:
@@ -253,6 +310,12 @@ def main():
                     process_messages()
         except Exception as e:
             log(f"轮询异常: {e}")
+
+        # 自愈巡检（每 _SELF_HEAL_INTERVAL 秒执行一次）
+        if now - last_heal_time >= _SELF_HEAL_INTERVAL:
+            last_heal_time = now
+            _self_heal()
+
         time.sleep(POLL_INTERVAL)
 
 
