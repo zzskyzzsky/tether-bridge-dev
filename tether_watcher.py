@@ -38,27 +38,37 @@ def log(msg):
 
 
 GATEWAY_PORT = 8642
+_last_restart_time = 0  # 重启防抖计时
 
 
 def _is_gateway_alive():
-    """快速探测 Gateway 是否存活（端口可达）"""
+    """快速探测 Gateway 是否存活（HTTP /health 返回 200 才算活）"""
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:{GATEWAY_PORT}/api/sessions")
-        headers = _gateway_headers()
-        for k, v in headers.items():
-            req.add_header(k, v)
+        req = urllib.request.Request(f"http://127.0.0.1:{GATEWAY_PORT}/health")
         with urllib.request.urlopen(req, timeout=3) as resp:
-            return True
+            return resp.status == 200
     except Exception:
         return False
 
 
 def _ensure_gateway_alive():
-    """如果 Gateway 挂了，尝试自动重启 hermes-gateway.service"""
+    """如果 Gateway 挂了，尝试自动重启 hermes-gateway.service
+
+    包含重启防抖：连续两次重启间隔至少 30 秒，防止无限重启循环。
+    """
+    global _last_restart_time
+
     if _is_gateway_alive():
         return True
 
-    log(f"⚠️ Gateway ({GATEWAY_PORT}) 不可达，尝试重启 hermes-gateway.service…")
+    # 防抖：上次重启距今不足 30 秒则跳过
+    now = time.time()
+    if now - _last_restart_time < 30:
+        log(f"⏳ Gateway 不可达但距上次重启仅 {now - _last_restart_time:.0f}s，跳过本次")
+        return False
+
+    log(f"⚠️ Gateway 不可达，尝试重启 hermes-gateway.service…")
+    _last_restart_time = now
     try:
         r = subprocess.run(
             ["systemctl", "--user", "restart", "hermes-gateway"],
@@ -68,13 +78,20 @@ def _ensure_gateway_alive():
             log(f"❌ systemctl restart 失败: {r.stderr.strip()[:80]}")
             return False
 
-        # 等待 Gateway 启动（最长 15 秒）
-        for i in range(5):
-            time.sleep(3)
+        # 等 5 秒再检查（给 Gateway 启动时间）
+        time.sleep(5)
+        if _is_gateway_alive():
+            log("✅ Gateway 已恢复（重启后 5 秒）")
+            return True
+
+        # 再等两轮（最长 ~15 秒）
+        for i in range(2):
+            time.sleep(5)
             if _is_gateway_alive():
-                log(f"✅ Gateway 已恢复（重启后 {3*(i+1)} 秒）")
+                log(f"✅ Gateway 已恢复（重启后 {5 + 5*(i+1)} 秒）")
                 return True
-        log("❌ Gateway 重启后仍未响应")
+
+        log("❌ Gateway 重启后仍未响应，继续走 hermes -z 保底")
         return False
     except Exception as e:
         log(f"❌ Gateway 重启异常: {str(e)[:80]}")
