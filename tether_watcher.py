@@ -13,6 +13,7 @@ os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
 os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 
 NOTIFY_FILE = "/tmp/tether_notify.json"
+HANDOFF_FILE = "/tmp/tether_handoff.json"
 TETHER_URL = "http://127.0.0.1:9001"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
 GATEWAY_SESSION = "tether-watcher"
@@ -243,29 +244,21 @@ def process_messages():
         mid = msg.get("id", "?")[:8]
         sender = msg.get("sender", "unknown")
         content = msg.get("message", "")
-        log(f"▶ 处理 {mid} from={sender}: {content[:80]}")
+        msg_type = msg.get("type", "info")
+        log(f"▶ 处理 {mid} from={sender} type={msg_type}: {content[:60]}")
 
         prompt = (
             f"[Tether Agent-to-Agent] 来自 {sender}：\n{content}\n\n"
             f"这是另一台 Hermes agent 通过 Tether 发来的消息。\n"
             f"1) 如果需要执行任务，使用 terminal 等工具完成\n"
             f"2) 如需回复对方，使用 curl POST 到对方 Tether 的 /message 端点\n"
-            f"3) 你的回复输出会被记录但不会自动转发"
+            f"3) 处理完成后输出总结"
         )
 
         processed = False
 
-        # 优先走 Gateway
-        output, err = _gateway_chat(prompt, timeout=300)
-        if err is None and output is not None:
-            has_out = bool(output)
-            log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
-            processed = True
-        else:
-            log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
-
-        # Gateway 失败则走子进程
-        if not processed:
+        if msg_type == "handoff" or msg_type == "auto":
+            # handoff/auto 消息：直接走 hermes -z（需要工具执行能力，Gateway 只输出文本不执行操作）
             hermes = _find_hermes()
             if hermes:
                 try:
@@ -274,15 +267,47 @@ def process_messages():
                         capture_output=True, text=True, timeout=300
                     )
                     if r.returncode == 0 and r.stdout.strip():
-                        log(f"✅ {mid} 处理完成 (子进程, {len(r.stdout.strip())} chars)")
+                        log(f"✅ {mid} 处理完成 (hermes -z, {len(r.stdout.strip())} chars)")
                     else:
-                        log(f"⚠️ {mid} 处理完成但无输出")
+                        log(f"⚠️ {mid} 处理完成但无输出 (rc={r.returncode})")
+                    processed = True
                 except subprocess.TimeoutExpired:
                     log(f"⏰ {mid} 超时 (300s)")
+                except Exception as e:
+                    log(f"❌ {mid} 子进程异常: {str(e)[:80]}")
             else:
                 log("❌ 找不到 hermes CLI")
 
+        if not processed:
+            # info 消息：优先走 Gateway（更快更便宜），失败回退 hermes -z
+            output, err = _gateway_chat(prompt, timeout=300)
+            if err is None and output is not None:
+                has_out = bool(output)
+                log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
+                processed = True
+            else:
+                log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
+
+            # Gateway 失败则走子进程
+            if not processed:
+                hermes = _find_hermes()
+                if hermes:
+                    try:
+                        r = subprocess.run(
+                            [hermes, "-z", prompt],
+                            capture_output=True, text=True, timeout=300
+                        )
+                        if r.returncode == 0 and r.stdout.strip():
+                            log(f"✅ {mid} 处理完成 (子进程, {len(r.stdout.strip())} chars)")
+                        else:
+                            log(f"⚠️ {mid} 处理完成但无输出")
+                    except subprocess.TimeoutExpired:
+                        log(f"⏰ {mid} 超时 (300s)")
+                else:
+                    log("❌ 找不到 hermes CLI")
+
     log("✅ 本轮处理完成")
+
 
 
 def main():
@@ -302,15 +327,21 @@ def main():
         except Exception:
             pass
 
+    if not os.path.isfile(HANDOFF_FILE):
+        try:
+            with open(HANDOFF_FILE, "w") as f:
+                json.dump({}, f)
+        except Exception:
+            pass
+
     while True:
         now = time.time()
         try:
-            # 消息处理（notify 文件变化检测）
-            if os.path.isfile(NOTIFY_FILE):
-                mtime = os.path.getmtime(NOTIFY_FILE)
-                if mtime > last_mtime:
-                    last_mtime = mtime
-                    process_messages()
+            # 消息处理（每次轮询都尝试，不再依赖 mtime 变化）
+            # process_messages 内部有 if not msgs: return 的快速返回，没有多余开销
+            # 去掉 mtime 门控：避免 watcher 重启后因 mtime 未变而漏处理积压消息
+            process_messages()
+
         except Exception as e:
             log(f"轮询异常: {e}")
 
