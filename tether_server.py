@@ -60,7 +60,7 @@ def status():
 def receive():
     data = request.get_json(silent=True) or {}
     sender = data.get("from") or data.get("sender", "unknown")
-    content = data.get("message", "")
+    content = data.get("message") or data.get("content", "")
     if not content.strip():
         return jsonify({"status": "ok", "dropped": "empty"})
 
