@@ -226,8 +226,8 @@ def _find_hermes():
 
 
 def process_messages():
-    # 处理消息前先确保 Gateway 存活
-    _ensure_gateway_alive()
+    # 不在此处做自愈——自愈由 _self_heal() 每15s处理
+    # 如果 Gateway 挂了，_gateway_chat() 会回退到 hermes -z 子进程
 
     data, err = _tether_get("/messages?ack=1")
     if err or not data:
