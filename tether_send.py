@@ -26,6 +26,7 @@ import urllib.request
 import urllib.error
 
 SENDER_NAME = socket.gethostname()
+SENDER_NICK = os.environ.get("TETHER_SENDER_NICK", "tp-小钉hermes")
 ENV_HOST_KEY = "TETHER_PEER_HOST"
 DEFAULT_PORT = 9001
 DEFAULT_TYPE = "info"
@@ -96,8 +97,8 @@ def send(host: str, msg_type: str, message: str):
 
     # JSON body 同时携带 message 和 content 字段（兼容 v3 两种 receiver 实现）
     payload = json.dumps({
-        "from": f"{SENDER_NAME} (tp-小钉hermes)",
-        "sender": f"{SENDER_NAME} (tp-小钉hermes)",
+        "from": f"{SENDER_NAME} ({SENDER_NICK})",
+        "sender": f"{SENDER_NAME} ({SENDER_NICK})",
         "message": message,
         "content": message,
         "type": msg_type,
