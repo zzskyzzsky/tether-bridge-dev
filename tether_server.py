@@ -83,8 +83,8 @@ def receive():
             (msg_id, sender, content, _now(), msg_type))
 
     if msg_type == "handoff":
-        # handoff：仍然存 SQLite 和 handoff 文件（作为诊断备份），
-        # 但同时也写 notify 文件，让 watcher 统一处理（不再分流）
+        # handoff：存 SQLite + 写 handoff 文件，不触发 Watcher notify
+        # watcher 在主轮询中独立检查 handoff 文件
         try:
             with open(HANDOFF_FILE, "w") as f:
                 json.dump({
@@ -95,18 +95,17 @@ def receive():
                 }, f)
         except Exception:
             pass
-
-    # 所有消息类型都写 notify 文件（让 watcher 统一处理）
-    # handoff 类型的消息由 watcher 识别后走 hermes -z（有工具执行能力）
-    with _db() as conn:
-        cnt = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0").fetchone()[0]
-    _write_notify(content, cnt)
+    else:
+        # info 消息：正常触发 Watcher
+        with _db() as conn:
+            cnt = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0 AND type='info'").fetchone()[0]
+        _write_notify(content, cnt)
     return jsonify({"status": "ok", "message_id": msg_id})
 
 @app.route("/messages", methods=["GET"])
 def get_messages():
     auto_ack = request.args.get("ack", "1") == "1"
-    msg_type = request.args.get("type", "all")  # 默认返回全部消息（不再按类型分流）
+    msg_type = request.args.get("type", "info")  # 默认只返回 info 消息，传 all 返回全部
     with _db() as conn:
         if msg_type == "all":
             rows = conn.execute(
