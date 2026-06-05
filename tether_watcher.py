@@ -37,6 +37,50 @@ def log(msg):
     print(f"[watcher] {msg}", flush=True)
 
 
+GATEWAY_PORT = 8642
+
+
+def _is_gateway_alive():
+    """快速探测 Gateway 是否存活（端口可达）"""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{GATEWAY_PORT}/api/sessions")
+        headers = _gateway_headers()
+        for k, v in headers.items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return True
+    except Exception:
+        return False
+
+
+def _ensure_gateway_alive():
+    """如果 Gateway 挂了，尝试自动重启 hermes-gateway.service"""
+    if _is_gateway_alive():
+        return True
+
+    log(f"⚠️ Gateway ({GATEWAY_PORT}) 不可达，尝试重启 hermes-gateway.service…")
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "restart", "hermes-gateway"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            log(f"❌ systemctl restart 失败: {r.stderr.strip()[:80]}")
+            return False
+
+        # 等待 Gateway 启动（最长 15 秒）
+        for i in range(5):
+            time.sleep(3)
+            if _is_gateway_alive():
+                log(f"✅ Gateway 已恢复（重启后 {3*(i+1)} 秒）")
+                return True
+        log("❌ Gateway 重启后仍未响应")
+        return False
+    except Exception as e:
+        log(f"❌ Gateway 重启异常: {str(e)[:80]}")
+        return False
+
+
 def _tether_get(path):
     try:
         req = urllib.request.Request(f"{TETHER_URL}{path}")
@@ -108,6 +152,9 @@ def _find_hermes():
 
 
 def process_messages():
+    # 处理消息前先确保 Gateway 存活
+    _ensure_gateway_alive()
+
     data, err = _tether_get("/messages?ack=1")
     if err or not data:
         log(f"取消息失败: {err}")
@@ -165,6 +212,9 @@ def process_messages():
 
 
 def main():
+    # 启动时先确保 Gateway 存活
+    _ensure_gateway_alive()
+
     _ensure_gateway_session()
 
     log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s)")
