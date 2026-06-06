@@ -62,6 +62,63 @@ _DINGTALK_DEDUP_CACHE = {}  # content_hash -> timestamp
 _DINGTALK_DEDUP_SECS = 30
 DINGTALK_LOG_ONLY = False  # 正式通知，真实 POST 到钉钉群
 
+# OOM 自愈计数器：按 msg_id 跟踪连续 OOM
+_OOM_COUNTER = {}  # {msg_id: [count, timestamp]}
+_OOM_WINDOW = 300  # 5分钟窗口，超时重置
+_OOM_THRESHOLD = 3  # 连续 3 次同一 handoff OOM 触发链路重启
+
+
+def _detect_oom(returncode, msg_id=""):
+    """检测子进程 OOM（returncode=-9=SIGKILL）
+
+    RLIMIT_AS 触发 OOM killer 时内核发送 SIGKILL，returncode 为 -9。
+    带 per-msg_id 计数器，同一 handoff 连续 OOM N 次触发链路重启。
+    """
+    if returncode != -9:
+        return False
+
+    log(f"💥 OOM 事件: 子进程被 SIGKILL (returncode=-9)")
+
+    if not msg_id:
+        return True
+
+    # 清理 5 分钟窗口外的过期记录
+    now = time.time()
+    for mid in list(_OOM_COUNTER.keys()):
+        if now - _OOM_COUNTER[mid][1] > _OOM_WINDOW:
+            del _OOM_COUNTER[mid]
+
+    # 更新当前 msg_id 计数
+    if msg_id not in _OOM_COUNTER:
+        _OOM_COUNTER[msg_id] = [0, now]
+    _OOM_COUNTER[msg_id][0] += 1
+    _OOM_COUNTER[msg_id][1] = now
+    count = _OOM_COUNTER[msg_id][0]
+
+    log(f"📊 连续 OOM #{count}（msg_id={msg_id[:8]}）")
+
+    if count >= _OOM_THRESHOLD:
+        log(f"🚨 连续 {_OOM_THRESHOLD} 次 OOM（msg_id={msg_id[:8]}），触发链路重启")
+        # 先 ack 断开循环，再重启
+        _ack_handoff(msg_id)
+        _restart_watcher_chain(msg_id)
+
+    return True
+
+
+def _restart_watcher_chain(msg_id=""):
+    """重启 watcher 链路：先 ack handoff 断开循环，再重启 watcher 服务"""
+    try:
+        log(f"🔄 重启 tether-watcher.service...")
+        subprocess.run(
+            ["systemctl", "--user", "restart", "tether-watcher.service"],
+            capture_output=True, text=True, timeout=10
+        )
+        log(f"✅ tether-watcher.service 重启命令已发送")
+    except Exception as e:
+        log(f"❌ 重启 tether-watcher.service 失败: {e}")
+
+
 # process_messages 重入锁，防止递归
 _processing = False
 
@@ -488,13 +545,16 @@ def process_messages():
                             capture_output=True, text=True, timeout=300,
                             preexec_fn=_limit_memory
                         )
-                        if r.returncode == 0 and r.stdout.strip():
+                        if _detect_oom(r.returncode, msg.get("id", "")):
+                            # OOM 事件已记录，output 保持 None
+                            pass
+                        elif r.returncode == 0 and r.stdout.strip():
                             output = r.stdout.strip()
-                            log(f"\u2705 {mid} 处理完成 (子进程, {len(output)} chars)")
+                            log(f"✅ {mid} 处理完成 (子进程, {len(output)} chars)")
                         else:
-                            log(f"\u26a0\ufe0f {mid} 处理完成但无输出")
+                            log(f"⚠️ {mid} 子进程 rc={r.returncode}")
                     except subprocess.TimeoutExpired:
-                        log(f"\u23f0 {mid} 超时 (300s)")
+                        log(f"⏰ {mid} 超时 (300s)")
                 else:
                     log("\u274c 找不到 hermes CLI")
 
@@ -572,6 +632,7 @@ def process_handoffs():
     # 子线程运行 hermes -z，不阻塞主循环
     def _run_handoff(sender=sender, msg_id=msg_id):
         output = None
+        oom_detected = False
         try:
             cmd = _get_hermes_args(prompt)
             if not cmd:
@@ -582,8 +643,11 @@ def process_handoffs():
                 capture_output=True, text=True, timeout=300,
                 preexec_fn=_limit_memory
             )
-            output = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else ""
-            if output:
+            if _detect_oom(r.returncode, msg_id):
+                # OOM 事件已由 _detect_oom 处理（计数 + 达阈值内部 ack + 重启）
+                oom_detected = True
+            elif r.returncode == 0 and r.stdout.strip():
+                output = r.stdout.strip()
                 log(f"✅ Handoff 处理完成 ({len(output)} chars)")
                 _write_handoff_result(sender, summary[:40], output[:500])
             else:
@@ -603,7 +667,9 @@ def process_handoffs():
             _auto_reply(output, sender)
 
         # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
-        _ack_handoff(msg_id)
+        # OOM 时跳过 ack — 让未达阈值的 OOM 能被 recover 重试，达阈值的 OOM 已在 _detect_oom 内部 ack
+        if not oom_detected:
+            _ack_handoff(msg_id)
 
         # 处理完一条后尝试恢复下一条积压 handoff
         _recover_next_handoff()
