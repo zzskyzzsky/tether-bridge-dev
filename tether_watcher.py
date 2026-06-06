@@ -25,26 +25,33 @@ PEER_HOST = os.environ.get("TETHER_PEER_HOST", "")
 PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
 TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
-# 从环境变量或 ~/.hermes/.env 读取 Gateway API Key
+# 从环境变量或 ~/.hermes/.env 读取 Gateway API Key + DingTalk Webhook URL
 API_KEY_ENV = os.environ.get("API_SERVER_KEY", "")
-if API_KEY_ENV:
-    GATEWAY_API_KEY = API_KEY_ENV.strip()
-else:
-    _env_path = os.path.expanduser("~/.hermes/.env")
-    if os.path.isfile(_env_path):
-        try:
-            with open(_env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("API_SERVER_KEY="):
-                        GATEWAY_API_KEY = line.split("=", 1)[1].strip()
-                        break
-        except Exception:
-            pass
+GATEWAY_API_KEY = API_KEY_ENV.strip() if API_KEY_ENV else ""
+
+DINGTALK_WEBHOOK_URL = os.environ.get("DINGTALK_WEBHOOK_URL", "")
+
+_env_path = os.path.expanduser("~/.hermes/.env")
+if os.path.isfile(_env_path):
+    try:
+        with open(_env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("API_SERVER_KEY=") and not GATEWAY_API_KEY:
+                    GATEWAY_API_KEY = line.split("=", 1)[1].strip()
+                elif line.startswith("DINGTALK_WEBHOOK_URL=") and not DINGTALK_WEBHOOK_URL:
+                    DINGTALK_WEBHOOK_URL = line.split("=", 1)[1].strip()
+    except Exception:
+        pass
 
 # 自愈相关
 _last_restart_time = 0.0
 _SELF_HEAL_INTERVAL = 15  # 每15秒检查一次 tether 健康
+
+# DingTalk 通知桥
+_DINGTALK_DEDUP_CACHE = {}  # content_hash -> timestamp
+_DINGTALK_DEDUP_SECS = 30
+DINGTALK_LOG_ONLY = False  # 正式通知，真实 POST 到钉钉群
 
 # process_messages 重入锁，防止递归
 _processing = False
@@ -229,6 +236,98 @@ def _get_hermes_args(prompt):
     return cmd
 
 
+_REPORT_KEYWORDS = ["汇报给主人", "最终报告", "测试通过", "请汇报", "测试全部通过"]
+
+
+def _should_report(output):
+    """检查输出是否应该通过 DingTalk 汇报给主人，而不是自动回复给发送方"""
+    if not output:
+        return False
+    # [REPORT] 精确前缀
+    if output.startswith("[REPORT]"):
+        return True
+    # 关键词 fallback（AI 可能忘记加 [REPORT] 前缀）
+    output_lower = output.lower()
+    for kw in _REPORT_KEYWORDS:
+        if kw in output_lower:
+            return True
+    return False
+
+
+def _send_dingtalk(content):
+    """通过 DingTalk 群机器人 webhook 发送消息
+
+    读取 DINGTALK_WEBHOOK_URL，POST markdown 消息到钉钉群。
+    支持 dedup（30秒内同内容不重复发）和 log-only 测试模式。
+    """
+    if not content:
+        return
+    if not DINGTALK_WEBHOOK_URL:
+        log("⚠️ DINGTALK_WEBHOOK_URL 未配置，跳过 DingTalk 通知")
+        _write_report_to_file(content)
+        return
+
+    # Dedup：30秒内相同内容 hash 不重复发
+    content_hash = __import__("hashlib").md5(content.encode()).hexdigest()
+    now = time.time()
+    if content_hash in _DINGTALK_DEDUP_CACHE:
+        if now - _DINGTALK_DEDUP_CACHE[content_hash] < _DINGTALK_DEDUP_SECS:
+            log(f"⏭️ 跳过重复 DingTalk 通知（30秒内相同内容 {content_hash[:8]}）")
+            _write_report_to_file(content)
+            return
+    _DINGTALK_DEDUP_CACHE[content_hash] = now
+    # 定期清理过期缓存（最多保留 100 条）
+    if len(_DINGTALK_DEDUP_CACHE) > 100:
+        cutoff = now - _DINGTALK_DEDUP_SECS
+        for k, v in list(_DINGTALK_DEDUP_CACHE.items()):
+            if v < cutoff:
+                del _DINGTALK_DEDUP_CACHE[k]
+
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {
+            "title": "🤖 Tether 报告",
+            "text": f"🤖 **Tether 报告**\n\n{content[:4000]}",
+        },
+    }
+
+    if DINGTALK_LOG_ONLY:
+        log(f"📋 [LOG-ONLY] DingTalk 通知（{len(content)} chars）: {content[:200]}")
+        _write_report_to_file(content)
+        return
+
+    try:
+        req = urllib.request.Request(
+            DINGTALK_WEBHOOK_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        if result.get("errcode") == 0:
+            log("✅ DingTalk 通知发送成功")
+        else:
+            log(f"⚠️ DingTalk 返回错误: {result.get('errmsg', 'unknown')}")
+    except Exception as e:
+        log(f"❌ DingTalk POST 失败: {str(e)[:60]}")
+    _write_report_to_file(content)
+
+
+def _write_report_to_file(content):
+    """将汇报内容写入临时文件，供主 session 下次启动时读取"""
+    try:
+        now = __import__("datetime").datetime.now().isoformat()
+        with open(HANDOFF_RESULT_FILE, "w") as f:
+            json.dump({
+                "type": "report",
+                "content": content,
+                "time": now,
+            }, f)
+    except Exception:
+        pass
+
+
 def _auto_reply(output, sender_info):
     """自动回复：将 hermes -z / Gateway 的输出 POST 回发送方 Tether
 
@@ -270,9 +369,71 @@ def _auto_reply(output, sender_info):
         req = urllib.request.Request(peer_url, data=payload,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10):
-            log(f"\udce4 自动回复 {len(reply_text)} chars 到 {target_host}")
+            log(f"📤 自动回复 {len(reply_text)} chars 到 {target_host}")
     except Exception as e:
-        log(f"\u23f0 自动回复失败: {str(e)[:60]}")
+        log(f"⏰ 自动回复失败: {str(e)[:60]}")
+
+
+# DingTalk 通知相关
+_last_dingtalk_time = 0.0  # 上次发 DingTalk 通知的时间（30s 去重）
+
+
+def _send_dingtalk_notification(output, sender_info):
+    """发送 DingTalk 群通知：将 Tether 消息处理结果推送到钉钉群。
+
+    遵守 4 条约定：
+    - 先 log 再 POST（信息不会丢）
+    - 30s 去重（不刷屏）
+    - Fallback：POST 失败时 log error
+    - Webhook URL 由主人在 .env 中配置，不自动生成
+    """
+    if not DINGTALK_WEBHOOK_URL:
+        return  # 未配置 webhook，不通知
+
+    if not output or not sender_info:
+        return
+
+    # 30s 去重
+    global _last_dingtalk_time
+    now = time.time()
+    if now - _last_dingtalk_time < 30:
+        return
+    _last_dingtalk_time = now
+
+    # 先 log 再 POST
+    log(f"📣 DingTalk 通知: {len(output)} chars from={sender_info[:40]}")
+
+    # 截断输出，钉钉消息不宜过长
+    text = output[:2000]
+
+    # 提取 sender 简短描述
+    sender_desc = sender_info.strip()
+
+    payload = json.dumps({
+        "msgtype": "markdown",
+        "markdown": {
+            "title": "Hermes Tether 通知",
+            "text": f"## Hermes Tether 通知\n\n"
+                    f"**来自**: {sender_desc}\n\n"
+                    f"{text}\n\n"
+                    f"---\n*Tether watcher 自动推送*"
+        }
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            DINGTALK_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get("errcode") == 0:
+                log("✅ DingTalk 通知发送成功")
+            else:
+                log(f"⚠️ DingTalk 通知返回异常: {result}")
+    except Exception as e:
+        log(f"⏰ DingTalk 通知失败: {str(e)[:80]}（信息已在日志中，无丢失）")
 
 
 def process_messages():
@@ -349,11 +510,16 @@ def process_messages():
                 else:
                     log("\u274c 找不到 hermes CLI")
 
-            # 自动回复：把 agent 的输出 POST 回发送方
+            # 汇报或自动回复：Report 发 DingTalk，其他回发送方
             if output and sender:
+                if _should_report(output):
+                    log(f"🔔 {mid} 标记为 Report → 走 DingTalk 通知")
+                    _send_dingtalk(output)
+
+                # 所有消息都 auto-reply 回发送方
                 _auto_reply(output, sender)
 
-        log(f"\u2705 本轮处理完成 ({len(msgs)} 条)")
+        log(f"✅ 本轮处理完成 ({len(msgs)} 条)")
         return len(msgs)
     finally:
         _processing = False
@@ -409,7 +575,8 @@ def process_handoffs():
         f"[Tether Handoff] 来自 {sender} 的接力消息：\n{summary}\n\n"
         f"这是另一台 Hermes agent 发来的 handoff 消息，需要你主动处理。\n"
         f"1) 分析消息内容并执行必要的操作（修改文件、重启服务等）\n"
-        f"2) 处理完成后输出总结（你的输出会自动回复给对方）\n"
+        f"2) 处理完成后输出总结\n"
+        f"3) 如果这是需要汇报给主人的最终报告，请在第一行写上 [REPORT]\n"
     )
 
     msg_id = handoff.get("msg_id", "")
@@ -437,9 +604,13 @@ def process_handoffs():
         except Exception as e:
             log(f"❌ Handoff 异常: {str(e)[:80]}")
 
-        # 自动回复：把 agent 的输出 POST 回发送方
+        # 汇报或自动回复：Report 发 DingTalk，其他回发送方
         if output and sender:
-            _auto_reply(output, sender)
+            if _should_report(output):
+                log(f"🔔 Handoff [{msg_id[:8]}] 标记为 Report → 走 DingTalk 通知")
+                _send_dingtalk(output)
+            else:
+                _auto_reply(output, sender)
 
         # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
         _ack_handoff(msg_id)

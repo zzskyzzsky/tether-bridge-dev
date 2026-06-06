@@ -132,6 +132,17 @@ def ack():
             conn.execute(f"UPDATE outgoing_messages SET acked=1 WHERE id IN ({','.join('?' for _ in msg_ids)})", msg_ids)
     return jsonify({"status": "ok", "acked": len(msg_ids)})
 
+
+@app.route("/pending", methods=["GET"])
+def pending_outgoing():
+    """返回本机已发送但尚未被对方 ack 的消息列表"""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, target_host, sender, message, sent_at, acked FROM outgoing_messages WHERE acked=0 ORDER BY sent_at DESC"
+        ).fetchall()
+    msgs = [dict(r) for r in rows]
+    return jsonify({"messages": msgs, "count": len(msgs)})
+
 def main():
     global LISTEN_PORT
     import argparse
