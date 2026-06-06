@@ -244,6 +244,7 @@ def _auto_reply(output, sender_info):
         # 无法从 sender 提取主机名时，回退到 PEER_HOST 环境变量
         target_host = os.environ.get("TETHER_PEER_HOST", "")
         if not target_host:
+            log("⚠️ TETHER_PEER_HOST 未设置且 sender 无主机名 → auto-reply 跳过，请设置 TETHER_PEER_HOST=对方主机名")
             return
 
     # 跳过自己发给自己的消息（防止回环）
