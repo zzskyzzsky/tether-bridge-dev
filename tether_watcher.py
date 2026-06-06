@@ -680,6 +680,35 @@ def process_handoffs():
     log("🔀 Handoff 已交给子线程处理，继续轮询")
 
 
+def _cleanup_old_messages():
+    """删除 7 天前的已确认消息（incoming + outgoing），控制 DB 无上限增长"""
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        if not os.path.isfile(db_path):
+            return
+        conn = sqlite3.connect(db_path, timeout=3)
+        keep_days = 7
+        # 删除 7 天前的 acked 入站消息
+        cur = conn.execute(
+            "DELETE FROM messages WHERE acked=1 AND received_at < datetime('now', ? || ' days')",
+            (f"-{keep_days}",)
+        )
+        del_in = cur.rowcount
+        # 删除 7 天前的 acked 出站消息
+        cur = conn.execute(
+            "DELETE FROM outgoing_messages WHERE acked=1 AND sent_at < datetime('now', ? || ' days')",
+            (f"-{keep_days}",)
+        )
+        del_out = cur.rowcount
+        conn.commit()
+        conn.close()
+        if del_in > 0 or del_out > 0:
+            log(f"🧹 DB 清理: 删除了 {del_in} 条入站 + {del_out} 条出站旧消息（> {keep_days} 天）")
+    except Exception as e:
+        log(f"DB 清理异常: {str(e)[:60]}")
+
+
 def _ack_handoff(msg_id):
     """标记 handoff 消息为已确认（acked=1），避免重复恢复"""
     if not msg_id:
@@ -818,10 +847,11 @@ def main():
         except Exception as e:
             log(f"轮询异常: {e}")
 
-        # 自愈巡检（每 _SELF_HEAL_INTERVAL 秒执行一次）
+        # 自愈巡检 + DB 清理（每 _SELF_HEAL_INTERVAL 秒执行一次）
         if now - last_heal_time >= _SELF_HEAL_INTERVAL:
             last_heal_time = now
             _self_heal()
+            _cleanup_old_messages()
 
         time.sleep(POLL_INTERVAL)
 

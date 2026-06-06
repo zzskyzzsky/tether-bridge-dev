@@ -1,11 +1,11 @@
 [Unit]
 Description=Tether Watcher — 2秒轮询处理消息
 After=tether.service
-BindsTo=tether.service
+# 注意：不使用 BindsTo，Tether Server 和 Watcher 是两个独立进程，
+# 任一重启不应连带杀死对方。启动顺序由 After 保证。
 
 [Service]
 Type=simple
-User=zzsky
 ExecStart=/home/zzsky/.hermes/tether/tether_watcher.py
 Restart=always
 RestartSec=2
