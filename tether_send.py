@@ -58,6 +58,13 @@ def parse_args():
                 sys.exit(1)
             msg_type = t
         else:
+            # 白名单：只认 --host/--type，其余 --xxx 跳过自身和下一个 token
+            if args[i].startswith("-"):
+                # 跳过 --xxx 及其值（AI 经常误传 --sender mac-弟弟 等）
+                i += 1  # skip flag name
+                if i < len(args) and not args[i].startswith("-"):
+                    i += 1  # skip flag value (unless next is also a flag)
+                continue
             # 第一个非 flag 参数视为消息内容
             if message is None:
                 message = args[i]
