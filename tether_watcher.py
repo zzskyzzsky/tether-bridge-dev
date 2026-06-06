@@ -15,7 +15,7 @@ os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
-HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watcher_heartbeat.json")
+HEARTBEAT_FILE = "/tmp/tether_watcher_heartbeat.json"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
 GATEWAY_SESSION = "tether-watcher"
 GATEWAY_API_KEY = ""
