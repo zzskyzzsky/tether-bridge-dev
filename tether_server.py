@@ -4,7 +4,7 @@ Tether Server v3 — 极简消息中转
 只做三件事：收消息、存 SQLite、写通知文件。
 支持 type=handoff 消息：存 SQLite + 写 handoff 文件，但不触发 Watcher。
 """
-import json, os, socket, sqlite3, uuid
+import json, os, socket, sqlite3, time, uuid
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
@@ -15,6 +15,8 @@ LISTEN_PORT = 9001
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
+HEARTBEAT_FILE = "/tmp/tether_watcher_heartbeat.json"
+HEARTBEAT_TIMEOUT = 15  # 心跳超过 15 秒判定 watcher 死亡
 
 def _db():
     conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -59,12 +61,31 @@ def ping():
 
 @app.route("/status", methods=["GET"])
 def status():
+    watcher_alive = False
+    watcher_pid = None
+    watcher_lag = None
+
+    try:
+        if os.path.isfile(HEARTBEAT_FILE):
+            with open(HEARTBEAT_FILE) as f:
+                hb = json.load(f)
+            hb_time = hb.get("timestamp", 0)
+            now = time.time()
+            watcher_lag = now - hb_time
+            watcher_alive = watcher_lag < HEARTBEAT_TIMEOUT
+            watcher_pid = hb.get("pid")
+    except Exception:
+        pass
+
     with _db() as conn:
         pending = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0").fetchone()[0]
         unacked = conn.execute("SELECT COUNT(*) FROM outgoing_messages WHERE acked=0").fetchone()[0]
     return jsonify({
         "hostname": HOSTNAME, "messages_pending": pending,
         "messages_unacked_outgoing": unacked, "time": _now(),
+        "watcher_alive": watcher_alive,
+        "watcher_pid": watcher_pid,
+        "watcher_lag": round(watcher_lag, 1) if watcher_lag is not None else None,
     })
 
 @app.route("/message", methods=["POST"])

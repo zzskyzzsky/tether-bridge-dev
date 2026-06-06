@@ -15,6 +15,7 @@ os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
+HEARTBEAT_FILE = "/tmp/tether_watcher_heartbeat.json"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
 GATEWAY_SESSION = "tether-watcher"
 GATEWAY_API_KEY = ""
@@ -768,6 +769,19 @@ def _validate_env():
         log(f"✅ TETHER_SENDER_NICK={sender_nick}")
 
 
+def _write_heartbeat():
+    """每轮主循环写入心跳文件：pid + 当前时间戳"""
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "timestamp": time.time(),
+                "time_iso": datetime.now(timezone.utc).isoformat(),
+            }, f)
+    except Exception:
+        pass
+
+
 def main():
     # 启动时先确保 Gateway 存活
     _ensure_gateway_alive()
@@ -785,6 +799,10 @@ def main():
 
     while True:
         now = time.time()
+
+        # 每轮写心跳文件，标记 watcher 存活
+        _write_heartbeat()
+
         try:
             # 主动轮询所有未处理消息（不再依赖 notify.json mtime 门控）
             # 每个轮询周期都拉取，移除竞态条件风险
