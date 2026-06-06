@@ -305,6 +305,13 @@ def process_messages():
             content = msg.get("message", "")
             log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
 
+            # 去重过滤：连续确认循环消息直接跳过（同 sender、含确认关键词、N 分钟内重复）
+            skip_keywords = ["已清理", "无积压", "无需操作", "不回复以阻断", "等主人回来",
+                            "不回复以阻断循环", "双方一致", "已对齐", "已确认"]
+            if any(kw in content for kw in skip_keywords):
+                log(f"\u23ed {mid} 跳过（确认循环消息）")
+                continue
+
             prompt = (
                 f"[Tether] 来自 {sender}：\n{content}\n\n"
                 f"这是另一台 Hermes agent 通过 Tether 发来的消息。\n"
