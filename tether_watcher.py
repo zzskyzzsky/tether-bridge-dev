@@ -46,6 +46,9 @@ else:
 _last_restart_time = 0.0
 _SELF_HEAL_INTERVAL = 15  # 每15秒检查一次 tether 健康
 
+# process_messages 重入锁，防止递归
+_processing = False
+
 
 def log(msg):
     print(f"[watcher] {msg}", flush=True)
@@ -269,67 +272,80 @@ def _auto_reply(output, sender_info):
 
 
 def process_messages():
-    # 不在此处做自愈——自愈由 _self_heal() 每15s处理
-    # 如果 Gateway 挂了，_gateway_chat() 会回退到 hermes -z 子进程
+    """从 Tether 拉取未处理消息并逐一处理。返回本次处理的消息数。
 
-    data, err = _tether_get("/messages?ack=1")
-    if err or not data:
-        log(f"取消息失败: {err}")
-        return
+    带 _processing 重入锁，防止递归调用（例如：gateway 处理过程中，
+    外部信号或回调又触发了 process_messages）。
+    """
+    global _processing
+    if _processing:
+        return 0
+    _processing = True
+    try:
+        # 不在此处做自愈——自愈由 _self_heal() 每15s处理
+        # 如果 Gateway 挂了，_gateway_chat() 会回退到 hermes -z 子进程
 
-    msgs = data.get("messages", [])
-    if not msgs:
-        return
+        data, err = _tether_get("/messages?ack=1")
+        if err or not data:
+            log(f"取消息失败: {err}")
+            return 0
 
-    log(f"\udcec {len(msgs)} 条新消息")
-    for msg in msgs:
-        mid = msg.get("id", "?")[:8]
-        sender = msg.get("sender", "unknown")
-        content = msg.get("message", "")
-        log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
+        msgs = data.get("messages", [])
+        if not msgs:
+            return 0
 
-        prompt = (
-            f"[Tether] 来自 {sender}：\n{content}\n\n"
-            f"这是另一台 Hermes agent 通过 Tether 发来的消息。\n"
-            f"请理解内容并直接处理或回复。处理完成后给出总结。"
-        )
+        log(f"\U0001f4ec {len(msgs)} 条新消息")
+        for msg in msgs:
+            mid = msg.get("id", "?")[:8]
+            sender = msg.get("sender", "unknown")
+            content = msg.get("message", "")
+            log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
 
-        processed = False
-        output = None
+            prompt = (
+                f"[Tether] 来自 {sender}：\n{content}\n\n"
+                f"这是另一台 Hermes agent 通过 Tether 发来的消息。\n"
+                f"请理解内容并直接处理或回复。处理完成后给出总结。"
+            )
 
-        # 优先走 Gateway
-        output, err = _gateway_chat(prompt, timeout=300)
-        if err is None and output is not None:
-            has_out = bool(output)
-            log(f"\u2705 {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
-            processed = True
-        else:
-            log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
+            processed = False
+            output = None
 
-        # Gateway 失败则走子进程
-        if not processed:
-            cmd = _get_hermes_args(prompt)
-            if cmd:
-                try:
-                    r = subprocess.run(
-                        cmd,
-                        capture_output=True, text=True, timeout=300
-                    )
-                    if r.returncode == 0 and r.stdout.strip():
-                        output = r.stdout.strip()
-                        log(f"\u2705 {mid} 处理完成 (子进程, {len(output)} chars)")
-                    else:
-                        log(f"\u26a0\ufe0f {mid} 处理完成但无输出")
-                except subprocess.TimeoutExpired:
-                    log(f"\u23f0 {mid} 超时 (300s)")
+            # 优先走 Gateway
+            output, err = _gateway_chat(prompt, timeout=300)
+            if err is None and output is not None:
+                has_out = bool(output)
+                log(f"\u2705 {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
+                processed = True
             else:
-                log("\u274c 找不到 hermes CLI")
+                log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
 
-        # 自动回复：把 agent 的输出 POST 回发送方
-        if output and sender:
-            _auto_reply(output, sender)
+            # Gateway 失败则走子进程
+            if not processed:
+                cmd = _get_hermes_args(prompt)
+                if cmd:
+                    try:
+                        r = subprocess.run(
+                            cmd,
+                            capture_output=True, text=True, timeout=300
+                        )
+                        if r.returncode == 0 and r.stdout.strip():
+                            output = r.stdout.strip()
+                            log(f"\u2705 {mid} 处理完成 (子进程, {len(output)} chars)")
+                        else:
+                            log(f"\u26a0\ufe0f {mid} 处理完成但无输出")
+                    except subprocess.TimeoutExpired:
+                        log(f"\u23f0 {mid} 超时 (300s)")
+                else:
+                    log("\u274c 找不到 hermes CLI")
 
-    log("\u2705 本轮处理完成")
+            # 自动回复：把 agent 的输出 POST 回发送方
+            if output and sender:
+                _auto_reply(output, sender)
+
+        log(f"\u2705 本轮处理完成 ({len(msgs)} 条)")
+        return len(msgs)
+    finally:
+        _processing = False
 
 
 def _write_handoff_result(sender, summary, output):
@@ -494,7 +510,11 @@ def main():
         try:
             # 主动轮询所有未处理消息（不再依赖 notify.json mtime 门控）
             # 每个轮询周期都拉取，移除竞态条件风险
-            process_messages()
+            count = process_messages()
+            # 如果本轮处理了消息，立即再 catch 一轮（最多追加1次），
+            # 捕获处理期间到达的漏网消息，不加 sleep
+            if count > 0:
+                process_messages()
 
             # handoff 文件检查（handoff 走独立渠道，由 server 写入 handoff 文件）
             process_handoffs()
