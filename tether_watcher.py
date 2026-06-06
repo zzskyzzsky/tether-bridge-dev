@@ -225,6 +225,19 @@ def _find_hermes():
     return None
 
 
+def _get_hermes_args(prompt):
+    """构建 hermes -z 命令行参数，支持通过 HERMES_EXTRA_FLAGS 环境变量传递额外参数"""
+    hermes = _find_hermes()
+    if not hermes:
+        return None
+    cmd = [hermes, "-z"]
+    extra = os.environ.get("HERMES_EXTRA_FLAGS", "").strip()
+    if extra:
+        cmd.extend(extra.split())
+    cmd.append(prompt)
+    return cmd
+
+
 def process_messages():
     # 不在此处做自愈——自愈由 _self_heal() 每15s处理
     # 如果 Gateway 挂了，_gateway_chat() 会回退到 hermes -z 子进程
@@ -245,11 +258,13 @@ def process_messages():
         content = msg.get("message", "")
         log(f"▶ 处理 {mid} from={sender}: {content[:80]}")
 
+        tether_send_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether_send.py")
         prompt = (
             f"[Tether Agent-to-Agent] 来自 {sender}：\n{content}\n\n"
             f"这是另一台 Hermes agent 通过 Tether 发来的消息。\n"
             f"1) 如果需要执行任务，使用 terminal 等工具完成\n"
-            f"2) 如需回复对方，使用 curl POST 到对方 Tether 的 /message 端点\n"
+            f"2) 如需回复对方，使用 tether_send.py 发送回复（位于 {tether_send_path}），\n"
+            f"   用法: python3 {tether_send_path} --host <对方主机> [--type handoff|info] \"回复内容\"\n"
             f"3) 你的回复输出会被记录但不会自动转发"
         )
 
@@ -266,11 +281,11 @@ def process_messages():
 
         # Gateway 失败则走子进程
         if not processed:
-            hermes = _find_hermes()
-            if hermes:
+            cmd = _get_hermes_args(prompt)
+            if cmd:
                 try:
                     r = subprocess.run(
-                        [hermes, "-z", prompt],
+                        cmd,
                         capture_output=True, text=True, timeout=300
                     )
                     if r.returncode == 0 and r.stdout.strip():
@@ -331,24 +346,25 @@ def process_handoffs():
     except OSError:
         pass
 
+    tether_send_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether_send.py")
     prompt = (
         f"[Tether Handoff] 来自 {sender} 的接力消息：\n{summary}\n\n"
         f"这是另一台 Hermes agent 发来的 handoff 消息，需要你主动处理。\n"
-        f"1) 分析消息内容并执行必要的操作（修改文件、重启服务、curl 回复等）\n"
-        f"2) 如需回复对方，使用 terminal 执行 curl POST 到对方 Tether 的 /message 端点\n"
+        f"1) 分析消息内容并执行必要的操作（修改文件、重启服务、tether_send.py 回复等）\n"
+        f"2) 如需回复对方，使用 tether_send.py 发送回复（位于 {tether_send_path}），\n"
+        f"   用法: python3 {tether_send_path} --host <对方主机> [--type handoff|info] \"回复内容\"\n"
         f"3) 处理完成后输出总结"
     )
-
-    hermes = _find_hermes()
-    if not hermes:
-        log("❌ 找不到 hermes CLI，handoff 跳过")
-        return
 
     # 子线程运行 hermes -z，不阻塞主循环
     def _run_handoff():
         try:
+            cmd = _get_hermes_args(prompt)
+            if not cmd:
+                log("❌ 找不到 hermes CLI，handoff 跳过")
+                return
             r = subprocess.run(
-                [hermes, "-z", prompt],
+                cmd,
                 capture_output=True, text=True, timeout=300
             )
             output = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else ""
