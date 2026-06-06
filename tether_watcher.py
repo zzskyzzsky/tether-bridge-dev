@@ -404,8 +404,10 @@ def process_handoffs():
         f"2) 处理完成后输出总结（你的输出会自动回复给对方）\n"
     )
 
+    msg_id = handoff.get("msg_id", "")
+
     # 子线程运行 hermes -z，不阻塞主循环
-    def _run_handoff(sender=sender):
+    def _run_handoff(sender=sender, msg_id=msg_id):
         output = None
         try:
             cmd = _get_hermes_args(prompt)
@@ -431,12 +433,33 @@ def process_handoffs():
         if output and sender:
             _auto_reply(output, sender)
 
+        # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
+        _ack_handoff(msg_id)
+
         # 处理完一条后尝试恢复下一条积压 handoff
         _recover_next_handoff()
 
     t = threading.Thread(target=_run_handoff, daemon=True)
     t.start()
     log("🔀 Handoff 已交给子线程处理，继续轮询")
+
+
+def _ack_handoff(msg_id):
+    """标记 handoff 消息为已确认（acked=1），避免重复恢复"""
+    if not msg_id:
+        return
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        if not os.path.isfile(db_path):
+            return
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
+        conn.commit()
+        conn.close()
+        log(f"✅ Handoff {msg_id[:8]} 已标记为 acked")
+    except Exception as e:
+        log(f"⚠️ 标记 handoff acked 失败: {str(e)[:60]}")
 
 
 def _recover_next_handoff():
