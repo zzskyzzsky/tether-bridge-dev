@@ -374,67 +374,6 @@ def _auto_reply(output, sender_info):
         log(f"⏰ 自动回复失败: {str(e)[:60]}")
 
 
-# DingTalk 通知相关
-_last_dingtalk_time = 0.0  # 上次发 DingTalk 通知的时间（30s 去重）
-
-
-def _send_dingtalk_notification(output, sender_info):
-    """发送 DingTalk 群通知：将 Tether 消息处理结果推送到钉钉群。
-
-    遵守 4 条约定：
-    - 先 log 再 POST（信息不会丢）
-    - 30s 去重（不刷屏）
-    - Fallback：POST 失败时 log error
-    - Webhook URL 由主人在 .env 中配置，不自动生成
-    """
-    if not DINGTALK_WEBHOOK_URL:
-        return  # 未配置 webhook，不通知
-
-    if not output or not sender_info:
-        return
-
-    # 30s 去重
-    global _last_dingtalk_time
-    now = time.time()
-    if now - _last_dingtalk_time < 30:
-        return
-    _last_dingtalk_time = now
-
-    # 先 log 再 POST
-    log(f"📣 DingTalk 通知: {len(output)} chars from={sender_info[:40]}")
-
-    # 截断输出，钉钉消息不宜过长
-    text = output[:2000]
-
-    # 提取 sender 简短描述
-    sender_desc = sender_info.strip()
-
-    payload = json.dumps({
-        "msgtype": "markdown",
-        "markdown": {
-            "title": "Hermes Tether 通知",
-            "text": f"## Hermes Tether 通知\n\n"
-                    f"**来自**: {sender_desc}\n\n"
-                    f"{text}\n\n"
-                    f"---\n*Tether watcher 自动推送*"
-        }
-    }).encode()
-
-    try:
-        req = urllib.request.Request(
-            DINGTALK_WEBHOOK_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
-            if result.get("errcode") == 0:
-                log("✅ DingTalk 通知发送成功")
-            else:
-                log(f"⚠️ DingTalk 通知返回异常: {result}")
-    except Exception as e:
-        log(f"⏰ DingTalk 通知失败: {str(e)[:80]}（信息已在日志中，无丢失）")
-
 
 def process_messages():
     """从 Tether 拉取未处理消息并逐一处理。返回本次处理的消息数。
@@ -604,13 +543,14 @@ def process_handoffs():
         except Exception as e:
             log(f"❌ Handoff 异常: {str(e)[:80]}")
 
-        # 汇报或自动回复：Report 发 DingTalk，其他回发送方
+        # Handoff 处理结果：Report 走 DingTalk，所有消息都 auto-reply 回发送方
         if output and sender:
             if _should_report(output):
                 log(f"🔔 Handoff [{msg_id[:8]}] 标记为 Report → 走 DingTalk 通知")
                 _send_dingtalk(output)
-            else:
-                _auto_reply(output, sender)
+
+            # 所有消息都 auto-reply 回发送方
+            _auto_reply(output, sender)
 
         # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
         _ack_handoff(msg_id)
