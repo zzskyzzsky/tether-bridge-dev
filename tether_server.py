@@ -15,7 +15,7 @@ LISTEN_PORT = 9001
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
-HEARTBEAT_FILE = "/tmp/tether_watcher_heartbeat.json"
+HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watcher_heartbeat.json")
 HEARTBEAT_TIMEOUT = 15  # 心跳超过 15 秒判定 watcher 死亡
 
 def _db():
