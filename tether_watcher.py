@@ -1,13 +1,10 @@
 #!/home/zzsky/.hermes/tether/venv/bin/python3
-"""
+""""
 Tether Watcher — 事件驱动消息处理器
-2 秒轮询 /tmp/tether_notify.json 的修改时间，
-发现新消息就走 Gateway API 处理，Gateway 不可用时回退到 hermes -z。
+2 秒轮询 /messages?ack=1 获取新消息 + 监控 handoff 文件。
+处理完消息后自动将 agent 的回复 POST 回对方 Tether，无需 agent 手动执行命令。
 
 独立于 tether_server.py 运行，没有耦合。
-
-同时监控 /tmp/tether_handoff.json，发现 handoff 消息就通过 hermes -z
-子进程处理（handoff 需要完整的 agent session 来执行工具和回复）。
 """
 import json, os, subprocess, threading, time, urllib.request
 
@@ -23,6 +20,10 @@ GATEWAY_SESSION = "tether-watcher"
 GATEWAY_API_KEY = ""
 HANDOFF_RESULT_FILE = "/tmp/tether_handoff_result.json"
 POLL_INTERVAL = 2
+
+# 同行 Tether 地址（对方 Hermes 实例，用于自动回复）
+PEER_HOST = os.environ.get("TETHER_PEER_HOST", "")
+PEER_PORT = 9001
 
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key
 API_KEY_ENV = os.environ.get("API_SERVER_KEY", "")
@@ -78,55 +79,42 @@ def _ensure_gateway_alive():
     """如果 Gateway 挂了，尝试自动重启 hermes-gateway.service
 
     包含重启防抖：连续两次重启间隔至少 30 秒，防止无限重启循环。
-    重启后等待 5 秒再检查，若未就绪再等两轮（最长 ~15 秒）。
     """
     global _last_restart_time
-
-    if _is_gateway_alive():
-        return True
-
     now = time.time()
     if now - _last_restart_time < 30:
-        log(f"⏳ Gateway 不可达但距上次重启仅 {now - _last_restart_time:.0f}s，跳过本次")
-        return False
-
-    log(f"⚠️ Gateway 不可达，尝试重启 hermes-gateway.service…")
+        return  # 防抖：30秒内不重复重启
     _last_restart_time = now
+
+    if _is_gateway_alive():
+        return
+
+    log("⚠️ Gateway 不在线，尝试重启...")
     try:
-        r = subprocess.run(
-            ["systemctl", "--user", "restart", "hermes-gateway"],
-            capture_output=True, text=True, timeout=15,
+        subprocess.run(
+            ["systemctl", "--user", "restart", "hermes-gateway.service"],
+            capture_output=True, text=True, timeout=10
         )
-        if r.returncode != 0:
-            log(f"❌ systemctl restart 失败: {r.stderr.strip()[:80]}")
-            return False
-
-        time.sleep(5)
-        if _is_gateway_alive():
-            log("✅ Gateway 已恢复（重启后 5 秒）")
-            return True
-
-        for i in range(2):
-            time.sleep(5)
-            if _is_gateway_alive():
-                log(f"✅ Gateway 已恢复（重启后 {5 + 5*(i+1)} 秒）")
-                return True
-
-        log("❌ Gateway 重启后仍未响应，继续走 hermes -z 保底")
-        return False
     except Exception as e:
-        log(f"❌ Gateway 重启异常: {str(e)[:80]}")
-        return False
+        log(f"❌ 重启命令失败: {e}")
+        return
+
+    for attempt in range(6):
+        if _is_gateway_alive():
+            log(f"✅ Gateway 重启成功（第{attempt+1}次检查）")
+            return
+        time.sleep(5)
+    log("❌ Gateway 重启确认失败")
 
 
-def _restart_tether():
-    """重启本地 tether.service，带防抖（<30s 跳过）"""
+def _tether_restart():
+    """自动重启 tether.service"""
     global _last_restart_time
     now = time.time()
     if now - _last_restart_time < 30:
-        log(f"⏭️ 重启跳过：距上次重启 {now - _last_restart_time:.0f}s < 30s")
-        return False
+        return
     _last_restart_time = now
+
     log("🔄 尝试重启 tether.service...")
     try:
         subprocess.run(
@@ -238,6 +226,48 @@ def _get_hermes_args(prompt):
     return cmd
 
 
+def _auto_reply(output, sender_info):
+    """自动回复：将 hermes -z / Gateway 的输出 POST 回发送方 Tether
+
+    sender_info 是消息中的 sender 字段值，格式为 'hostname (nickname)'。
+    从 sender_info 中提取 hostname，解析出对方的 Tether 地址。
+    """
+    if not output or not sender_info:
+        return
+
+    # 从 sender_info 中提取主机名（格式: "hostname (nickname)"）
+    target_host = sender_info.split()[0] if sender_info else ""
+    if not target_host or target_host in ("unknown",):
+        return
+
+    # 跳过自己发给自己的消息（防止回环）
+    local_hostname = __import__("socket").gethostname()
+    if target_host == local_hostname:
+        return
+
+    peer_url = f"http://{target_host}:{PEER_PORT}/message"
+    hostname = __import__("socket").gethostname()
+    sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
+
+    # 只取输出前 4000 字符，防止过长
+    reply_text = output[:4000]
+
+    try:
+        payload = json.dumps({
+            "from": f"{hostname} ({sender_nick})",
+            "sender": f"{hostname} ({sender_nick})",
+            "message": reply_text,
+            "content": reply_text,
+            "type": "info",
+        }).encode()
+        req = urllib.request.Request(peer_url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10):
+            log(f"\udce4 自动回复 {len(reply_text)} chars 到 {target_host}")
+    except Exception as e:
+        log(f"\u23f0 自动回复失败: {str(e)[:60]}")
+
+
 def process_messages():
     # 不在此处做自愈——自愈由 _self_heal() 每15s处理
     # 如果 Gateway 挂了，_gateway_chat() 会回退到 hermes -z 子进程
@@ -251,30 +281,27 @@ def process_messages():
     if not msgs:
         return
 
-    log(f"📬 {len(msgs)} 条新消息")
+    log(f"\udcec {len(msgs)} 条新消息")
     for msg in msgs:
         mid = msg.get("id", "?")[:8]
         sender = msg.get("sender", "unknown")
         content = msg.get("message", "")
-        log(f"▶ 处理 {mid} from={sender}: {content[:80]}")
+        log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
 
-        tether_send_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether_send.py")
         prompt = (
-            f"[Tether Agent-to-Agent] 来自 {sender}：\n{content}\n\n"
+            f"[Tether] 来自 {sender}：\n{content}\n\n"
             f"这是另一台 Hermes agent 通过 Tether 发来的消息。\n"
-            f"1) 如果需要执行任务，使用 terminal 等工具完成\n"
-            f"2) 如需回复对方，使用 tether_send.py 发送回复（位于 {tether_send_path}），\n"
-            f"   用法: python3 {tether_send_path} --host <对方主机> [--type handoff|info] \"回复内容\"\n"
-            f"3) 你的回复输出会被记录但不会自动转发"
+            f"请理解内容并直接处理或回复。处理完成后给出总结。"
         )
 
         processed = False
+        output = None
 
         # 优先走 Gateway
         output, err = _gateway_chat(prompt, timeout=300)
         if err is None and output is not None:
             has_out = bool(output)
-            log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
+            log(f"\u2705 {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
             processed = True
         else:
             log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
@@ -289,15 +316,20 @@ def process_messages():
                         capture_output=True, text=True, timeout=300
                     )
                     if r.returncode == 0 and r.stdout.strip():
-                        log(f"✅ {mid} 处理完成 (子进程, {len(r.stdout.strip())} chars)")
+                        output = r.stdout.strip()
+                        log(f"\u2705 {mid} 处理完成 (子进程, {len(output)} chars)")
                     else:
-                        log(f"⚠️ {mid} 处理完成但无输出")
+                        log(f"\u26a0\ufe0f {mid} 处理完成但无输出")
                 except subprocess.TimeoutExpired:
-                    log(f"⏰ {mid} 超时 (300s)")
+                    log(f"\u23f0 {mid} 超时 (300s)")
             else:
-                log("❌ 找不到 hermes CLI")
+                log("\u274c 找不到 hermes CLI")
 
-    log("✅ 本轮处理完成")
+        # 自动回复：把 agent 的输出 POST 回发送方
+        if output and sender:
+            _auto_reply(output, sender)
+
+    log("\u2705 本轮处理完成")
 
 
 def _write_handoff_result(sender, summary, output):
@@ -315,7 +347,7 @@ def process_handoffs():
     """检查 handoff 文件，有内容就通过 hermes -z 处理（需要工具执行能力）
 
     通过子线程运行 hermes -z，不阻塞主循环（info 消息处理不受影响）。
-    处理完成后删除 handoff 文件而非写入 {}，避免每次轮询无效 IO。
+    处理完成后自动回复到发送方。
     """
     if not os.path.isfile(HANDOFF_FILE):
         return
@@ -338,7 +370,7 @@ def process_handoffs():
         _recover_next_handoff()
         return
 
-    log(f"📋 发现 handoff from={sender}: {summary[:60]}...")
+    log(f"\udccb 发现 handoff from={sender}: {summary[:60]}...")
 
     # 先删除 handoff 文件，防止重复处理
     try:
@@ -346,18 +378,16 @@ def process_handoffs():
     except OSError:
         pass
 
-    tether_send_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether_send.py")
     prompt = (
         f"[Tether Handoff] 来自 {sender} 的接力消息：\n{summary}\n\n"
         f"这是另一台 Hermes agent 发来的 handoff 消息，需要你主动处理。\n"
-        f"1) 分析消息内容并执行必要的操作（修改文件、重启服务、tether_send.py 回复等）\n"
-        f"2) 如需回复对方，使用 tether_send.py 发送回复（位于 {tether_send_path}），\n"
-        f"   用法: python3 {tether_send_path} --host <对方主机> [--type handoff|info] \"回复内容\"\n"
-        f"3) 处理完成后输出总结"
+        f"1) 分析消息内容并执行必要的操作（修改文件、重启服务等）\n"
+        f"2) 处理完成后输出总结（你的输出会自动回复给对方）\n"
     )
 
     # 子线程运行 hermes -z，不阻塞主循环
-    def _run_handoff():
+    def _run_handoff(sender=sender):
+        output = None
         try:
             cmd = _get_hermes_args(prompt)
             if not cmd:
@@ -370,7 +400,6 @@ def process_handoffs():
             output = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else ""
             if output:
                 log(f"✅ Handoff 处理完成 ({len(output)} chars)")
-                # 将处理摘要写入结果文件，供 Gateway session 读取
                 _write_handoff_result(sender, summary[:40], output[:500])
             else:
                 log(f"⚠️ Handoff 完成但无输出 (rc={r.returncode})")
@@ -378,6 +407,11 @@ def process_handoffs():
             log(f"⏰ Handoff 超时 (300s)")
         except Exception as e:
             log(f"❌ Handoff 异常: {str(e)[:80]}")
+
+        # 自动回复：把 agent 的输出 POST 回发送方
+        if output and sender:
+            _auto_reply(output, sender)
+
         # 处理完一条后尝试恢复下一条积压 handoff
         _recover_next_handoff()
 
@@ -452,29 +486,17 @@ def main():
     # 启动时恢复因 watcher 重启而残留的未处理 handoff
     _recover_stale_handoffs()
 
-    log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s, 自愈={_SELF_HEAL_INTERVAL}s)")
-    last_mtime = 0
+    log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s, 自愈={_SELF_HEAL_INTERVAL}s, 轮询模式)")
     last_heal_time = 0.0
-
-    if not os.path.isfile(NOTIFY_FILE):
-        try:
-            with open(NOTIFY_FILE, "w") as f:
-                json.dump({"time": "", "preview": "", "count": 0}, f)
-        except Exception:
-            pass
 
     while True:
         now = time.time()
         try:
-            # 消息处理（notify 文件变化检测）
-            if os.path.isfile(NOTIFY_FILE):
-                mtime = os.path.getmtime(NOTIFY_FILE)
-                if mtime > last_mtime:
-                    last_mtime = mtime
-                    process_messages()
+            # 主动轮询所有未处理消息（不再依赖 notify.json mtime 门控）
+            # 每个轮询周期都拉取，移除竞态条件风险
+            process_messages()
 
-            # handoff 文件检查（每次轮询都检查，不依赖 mtime）
-            # handoff 消息不带 notify，由独立文件传递
+            # handoff 文件检查（handoff 走独立渠道，由 server 写入 handoff 文件）
             process_handoffs()
 
         except Exception as e:
