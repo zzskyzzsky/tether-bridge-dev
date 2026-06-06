@@ -385,7 +385,7 @@ def _auto_reply(output, sender_info):
             "sender": f"{hostname} ({sender_nick})",
             "message": reply_text,
             "content": reply_text,
-            "type": "info",
+            "type": "auto_reply",
         }).encode()
         req = urllib.request.Request(peer_url, data=payload,
                                      headers={"Content-Type": "application/json"})
@@ -439,6 +439,11 @@ def process_messages():
             sender = msg.get("sender", "unknown")
             content = msg.get("message", "")
             log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
+
+            # 跳过 auto_reply 类型消息（防止 watcher 间自动回复回环）
+            if msg.get("type") == "auto_reply":
+                log(f"\u23ed {mid} 跳过（auto_reply 类型，防止回环）")
+                continue
 
             # 去重过滤：连续确认循环消息直接跳过（同 sender、含确认关键词、N 分钟内重复）
             skip_keywords = ["已清理", "无积压", "无需操作", "不回复以阻断", "等主人回来",
