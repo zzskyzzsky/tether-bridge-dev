@@ -38,15 +38,39 @@ DEFAULT_TYPE = "info"
 VALID_TYPES = {"info", "handoff"}
 
 
+def print_usage():
+    """打印完整帮助信息"""
+    print("用法: tether_send.py [选项] <消息内容>", file=sys.stderr)
+    print("       echo '消息' | tether_send.py [选项]", file=sys.stderr)
+    print("       tether_send.py --host <host> < file", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("选项:", file=sys.stderr)
+    print("  --help              显示此帮助", file=sys.stderr)
+    print("  --host, -h <主机>   目标主机（Tailscale 主机名或 IP）", file=sys.stderr)
+    print("  --port, -p <端口>   目标端口（默认 9001）", file=sys.stderr)
+    print("  --type, -t <类型>   消息类型: info（默认）| handoff", file=sys.stderr)
+    print("  --nick <昵称>       发送方昵称（覆盖环境变量 TETHER_SENDER_NICK）", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("环境变量:", file=sys.stderr)
+    print(f"  {ENV_HOST_KEY}     默认目标主机", file=sys.stderr)
+    print(f"  TETHER_SENDER_NICK   发送方昵称", file=sys.stderr)
+    print(f"  TETHER_PEER_PORT     目标端口", file=sys.stderr)
+
+
 def parse_args():
     args = sys.argv[1:]
     host = None
     msg_type = DEFAULT_TYPE
     message = None
+    nick = None
+    port = None
 
     i = 0
     while i < len(args):
-        if args[i] in ("--host", "-h"):
+        if args[i] == "--help":
+            print_usage()
+            sys.exit(0)
+        elif args[i] in ("--host", "-h"):
             i += 1
             if i >= len(args):
                 print("❌ --host 缺少参数值", file=sys.stderr)
@@ -62,8 +86,24 @@ def parse_args():
                 print(f"❌ 无效 type: {t}，可选: info, handoff", file=sys.stderr)
                 sys.exit(1)
             msg_type = t
+        elif args[i] in ("--port", "-p"):
+            i += 1
+            if i >= len(args):
+                print("❌ --port 缺少参数值", file=sys.stderr)
+                sys.exit(1)
+            try:
+                port = int(args[i])
+            except ValueError:
+                print(f"❌ 无效端口: {args[i]}", file=sys.stderr)
+                sys.exit(1)
+        elif args[i] == "--nick":
+            i += 1
+            if i >= len(args):
+                print("❌ --nick 缺少参数值", file=sys.stderr)
+                sys.exit(1)
+            nick = args[i]
         else:
-            # 白名单：只认 --host/--type，其余 --xxx 跳过自身和下一个 token
+            # 白名单：只认 --host/--type/--port/--nick，其余 --xxx 跳过自身和下一个 token
             if args[i].startswith("-"):
                 # 跳过 --xxx 及其值（AI 经常误传 --sender mac-弟弟 等）
                 i += 1  # skip flag name
@@ -85,32 +125,38 @@ def parse_args():
         if not sys.stdin.isatty():
             message = sys.stdin.read().strip()
 
-    return host, msg_type, message
+    return host, msg_type, message, nick, port
 
 
-def send(host: str, msg_type: str, message: str):
+def send(host: str, msg_type: str, message: str, port: int | None = None, nick: str | None = None):
     if not message:
         print("⚠️ 空消息，跳过发送", file=sys.stderr)
         sys.exit(0)
 
     # 解析 host（支持 hostname/Tailscale MagicDNS，不包含 port）
-    if ":" in host:
-        target_host, port_str = host.rsplit(":", 1)
-        try:
-            port = int(port_str)
-        except ValueError:
-            print(f"❌ 无效端口: {port_str}", file=sys.stderr)
-            sys.exit(1)
+    if port is None:
+        if ":" in host:
+            target_host, port_str = host.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                print(f"❌ 无效端口: {port_str}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            target_host = host
+            port = DEFAULT_PORT
     else:
         target_host = host
-        port = DEFAULT_PORT
+
+    # --nick 覆盖默认昵称
+    sender_nick = nick or SENDER_NICK
 
     url = f"http://{target_host}:{port}/message"
 
     # JSON body 同时携带 message 和 content 字段（兼容 v3 两种 receiver 实现）
     payload = json.dumps({
-        "from": f"{SENDER_NAME} ({SENDER_NICK})",
-        "sender": f"{SENDER_NAME} ({SENDER_NICK})",
+        "from": f"{SENDER_NAME} ({sender_nick})",
+        "sender": f"{SENDER_NAME} ({sender_nick})",
         "message": message,
         "content": message,
         "type": msg_type,
@@ -153,16 +199,13 @@ def send(host: str, msg_type: str, message: str):
 
 
 def main():
-    host, msg_type, message = parse_args()
+    host, msg_type, message, nick, port = parse_args()
 
     if not message:
-        print("用法: tether_send.py [--host HOST] [--type info|handoff] <消息内容>", file=sys.stderr)
-        print("       echo '消息' | tether_send.py [--host HOST]", file=sys.stderr)
-        print("")
-        print(f"环境变量 {ENV_HOST_KEY} 可设默认目标主机", file=sys.stderr)
+        print_usage()
         sys.exit(1)
 
-    ok = send(host, msg_type, message)
+    ok = send(host, msg_type, message, port, nick)
     sys.exit(0 if ok else 1)
 
 

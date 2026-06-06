@@ -527,14 +527,18 @@ def process_messages():
             processed = False
             output = None
 
-            # 优先走 Gateway
-            output, err = _gateway_chat(prompt, timeout=300)
-            if err is None and output is not None:
-                has_out = bool(output)
-                log(f"\u2705 {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
-                processed = True
+            # 快速探测 Gateway 存活（短超时 3s），死透则跳过 Gateway 直走子进程
+            # 避免 Gateway 挂了时每个消息等 300 秒超时才回退
+            if _is_gateway_alive():
+                output, err = _gateway_chat(prompt, timeout=300)
+                if err is None and output is not None:
+                    has_out = bool(output)
+                    log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
+                    processed = True
+                else:
+                    log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
             else:
-                log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
+                log(f"Gateway 不在线，直走子进程")
 
             # Gateway 失败则走子进程
             if not processed:
