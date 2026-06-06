@@ -116,13 +116,14 @@ def dump_messages(full=False, limit=None, since=None, direction='all'):
                 print(f"┌─ 收到的消息（均来自对方 Tether） ({len(rows)} 条) {'─'*30}")
                 for r in rows:
                     ts = parse_ts(r['received_at'])
-                    prefix = "IN " if r['type'] == 'info' else "HD "
+                    prefix = "[▶IN] " if r['type'] == 'info' else "[▶HD] "
                     raw_sender = r['sender'] or "?"
                     # 提取机器名和昵称
                     hostname_part = raw_sender.split('(')[0].strip() if '(' in raw_sender else raw_sender
                     nick_part = raw_sender.split('(')[1].rstrip(')').strip() if '(' in raw_sender else ""
                     sender_display = f"{nick_part:12s} @{hostname_part}"
-                    print(f"│ {prefix} {fmt_ts(ts):15s}{fmt_ago(ts):8s} {r['type']:7s} {sender_display}")
+                    ack_flag = "✓" if r['acked'] else "○"
+                    print(f"│ {prefix}{ack_flag} {fmt_ts(ts):15s}{fmt_ago(ts):8s} {r['type']:7s} {sender_display}")
                     msg = r['message'] or ''
                     if full:
                         print(f"│ {'─'*60}")
@@ -169,7 +170,7 @@ def dump_messages(full=False, limit=None, since=None, direction='all'):
                     target = r['target_host'] or "?"
                     nick = r['sender'] or "?"
                     ack_mark = "✓" if r['acked'] else "○"
-                    print(f"│ {ack_mark} {fmt_ts(ts):15s}{fmt_ago(ts):8s} → {target:15s}")
+                    print(f"│ [◀OUT] {ack_mark} {fmt_ts(ts):15s}{fmt_ago(ts):8s} → {target:15s}")
                     msg = r['message'] or ''
                     if full:
                         print(f"│ {'─'*60}")
@@ -211,7 +212,7 @@ def watch_mode(limit=5, full=False):
         while True:
             os.system('clear' if os.name == 'posix' else 'cls')
             print(f"⏳ Tether 监控 (每 5 秒刷新)  —  Ctrl+C 退出\n")
-            dump_messages(full=full, limit=limit, direction='in')
+            dump_messages(full=full, limit=limit, direction='all')
             time.sleep(5)
     except KeyboardInterrupt:
         print("\n监控已退出。")
