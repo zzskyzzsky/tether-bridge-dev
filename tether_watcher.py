@@ -359,6 +359,26 @@ def _auto_reply(output, sender_info):
     # 只取输出前 4000 字符，防止过长
     reply_text = output[:4000]
 
+    # 防自动回复循环：检查最近 N 秒内是否给同一目标发过相同内容
+    DEDUP_SECONDS = 30
+    try:
+        import sqlite3
+        _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        _conn = sqlite3.connect(_db_path, timeout=3)
+        _cur = _conn.execute(
+            "SELECT COUNT(*) FROM outgoing_messages "
+            "WHERE target_host = ? AND message = ? "
+            "AND sent_at > datetime('now', ? || ' seconds', 'utc')",
+            (target_host, reply_text, f"-{DEDUP_SECONDS}")
+        )
+        if _cur.fetchone()[0] > 0:
+            _conn.close()
+            log(f"⏭️ 跳过重复 auto-reply 到 {target_host}（{DEDUP_SECONDS}s 内已有相同内容）")
+            return
+        _conn.close()
+    except Exception:
+        pass
+
     try:
         payload = json.dumps({
             "from": f"{hostname} ({sender_nick})",
