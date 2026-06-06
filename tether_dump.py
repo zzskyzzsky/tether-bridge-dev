@@ -113,15 +113,16 @@ def dump_messages(full=False, limit=None, since=None, direction='all'):
 
             rows = conn.execute(q, params).fetchall()
             if rows:
-                print(f"┌─ 收到的消息 ({len(rows)} 条) {'─'*40}")
+                print(f"┌─ 收到的消息（均来自对方 Tether） ({len(rows)} 条) {'─'*30}")
                 for r in rows:
                     ts = parse_ts(r['received_at'])
                     prefix = "IN " if r['type'] == 'info' else "HD "
-                    nick = r['sender'] or "?"
-                    # 缩短昵称
-                    if '(' in nick:
-                        nick = nick.split('(')[1].rstrip(')')
-                    print(f"│ {prefix} {fmt_ts(ts):15s}{fmt_ago(ts):8s} {r['type']:7s} {nick:12s}")
+                    raw_sender = r['sender'] or "?"
+                    # 提取机器名和昵称
+                    hostname_part = raw_sender.split('(')[0].strip() if '(' in raw_sender else raw_sender
+                    nick_part = raw_sender.split('(')[1].rstrip(')').strip() if '(' in raw_sender else ""
+                    sender_display = f"{nick_part:12s} @{hostname_part}"
+                    print(f"│ {prefix} {fmt_ts(ts):15s}{fmt_ago(ts):8s} {r['type']:7s} {sender_display}")
                     msg = r['message'] or ''
                     if full:
                         print(f"│ {'─'*60}")
