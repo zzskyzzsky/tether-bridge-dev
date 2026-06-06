@@ -241,7 +241,10 @@ def _auto_reply(output, sender_info):
     # 从 sender_info 中提取主机名（格式: "hostname (nickname)"）
     target_host = sender_info.split()[0] if sender_info else ""
     if not target_host or target_host in ("unknown",):
-        return
+        # 无法从 sender 提取主机名时，回退到 PEER_HOST 环境变量
+        target_host = os.environ.get("TETHER_PEER_HOST", "")
+        if not target_host:
+            return
 
     # 跳过自己发给自己的消息（防止回环）
     local_hostname = __import__("socket").gethostname()
@@ -493,11 +496,28 @@ def _recover_stale_handoffs():
         log(f"handoff 恢复检查异常: {str(e)[:60]}")
 
 
+def _validate_env():
+    """启动时校验关键环境变量，缺失时输出警告（不阻塞启动）"""
+    if not PEER_HOST:
+        log("⚠️ TETHER_PEER_HOST 未设置 → auto-reply 不会自动回复，需手动发送")
+    else:
+        log(f"✅ TETHER_PEER_HOST={PEER_HOST}")
+
+    sender_nick = os.environ.get("TETHER_SENDER_NICK", "")
+    if not sender_nick:
+        log("⚠️ TETHER_SENDER_NICK 未设置 → 将使用主机名作为发送者昵称")
+    else:
+        log(f"✅ TETHER_SENDER_NICK={sender_nick}")
+
+
 def main():
     # 启动时先确保 Gateway 存活
     _ensure_gateway_alive()
 
     _ensure_gateway_session()
+
+    # 环境变量校验
+    _validate_env()
 
     # 启动时恢复因 watcher 重启而残留的未处理 handoff
     _recover_stale_handoffs()
