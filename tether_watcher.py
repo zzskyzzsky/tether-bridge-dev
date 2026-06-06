@@ -14,7 +14,6 @@ os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
-TETHER_URL = "http://127.0.0.1:9001"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
 GATEWAY_SESSION = "tether-watcher"
 GATEWAY_API_KEY = ""
@@ -23,7 +22,8 @@ POLL_INTERVAL = 2
 
 # 同行 Tether 地址（对方 Hermes 实例，用于自动回复）
 PEER_HOST = os.environ.get("TETHER_PEER_HOST", "")
-PEER_PORT = 9001
+PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
+TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key
 API_KEY_ENV = os.environ.get("API_SERVER_KEY", "")

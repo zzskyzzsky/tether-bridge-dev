@@ -28,7 +28,7 @@ import urllib.error
 SENDER_NAME = socket.gethostname()
 SENDER_NICK = os.environ.get("TETHER_SENDER_NICK", "tp-小钉hermes")
 ENV_HOST_KEY = "TETHER_PEER_HOST"
-DEFAULT_PORT = 9001
+DEFAULT_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
 DEFAULT_TYPE = "info"
 VALID_TYPES = {"info", "handoff"}
 
