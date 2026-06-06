@@ -6,7 +6,7 @@ Tether Watcher — 事件驱动消息处理器
 
 独立于 tether_server.py 运行，没有耦合。
 """
-import json, os, subprocess, threading, time, urllib.request, uuid
+import json, os, resource, subprocess, threading, time, urllib.request, uuid
 from datetime import datetime, timezone
 
 # 设置本机请求绕过 HTTP 代理（MacBook 上可能配了 Clash 环境变量）
@@ -45,7 +45,15 @@ if os.path.isfile(_env_path):
     except Exception:
         pass
 
-# 自愈相关
+def _limit_memory():
+    """限制子进程内存上限为 2GB，防止 OOM 拖垮整个机器"""
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (2*1024**3, 2*1024**3))
+    except (resource.error, ValueError, AttributeError):
+        pass  # 某些系统不支持，静默跳过
+
+
+# 自愈巡检计数器：连续失败次数超过阈值只打 WARN，不主动重启 watcher
 _last_restart_time = 0.0
 _SELF_HEAL_INTERVAL = 15  # 每15秒检查一次 tether 健康
 
@@ -477,7 +485,8 @@ def process_messages():
                     try:
                         r = subprocess.run(
                             cmd,
-                            capture_output=True, text=True, timeout=300
+                            capture_output=True, text=True, timeout=300,
+                            preexec_fn=_limit_memory
                         )
                         if r.returncode == 0 and r.stdout.strip():
                             output = r.stdout.strip()
@@ -570,7 +579,8 @@ def process_handoffs():
                 return
             r = subprocess.run(
                 cmd,
-                capture_output=True, text=True, timeout=300
+                capture_output=True, text=True, timeout=300,
+                preexec_fn=_limit_memory
             )
             output = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else ""
             if output:
