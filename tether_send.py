@@ -21,9 +21,14 @@ Tether Send — 极简跨机消息发送工具
 import json
 import os
 import socket
+import sqlite3
 import sys
+import uuid
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 
 SENDER_NAME = socket.gethostname()
 SENDER_NICK = os.environ.get("TETHER_SENDER_NICK", "tp-小钉hermes")
@@ -121,6 +126,17 @@ def send(host: str, msg_type: str, message: str):
                 result = json.loads(resp.read().decode())
             msg_id = result.get("message_id", "?")
             print(f"✅ [{msg_type}] → {target_host}:{port}  message_id={msg_id[:8]}")
+            # 记录到 outgoing_messages
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=3)
+                conn.execute(
+                    "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
+                    (msg_id, target_host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).isoformat())
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
             return True
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
             err = str(e)

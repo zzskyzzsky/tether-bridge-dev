@@ -6,7 +6,8 @@ Tether Watcher — 事件驱动消息处理器
 
 独立于 tether_server.py 运行，没有耦合。
 """
-import json, os, subprocess, threading, time, urllib.request
+import json, os, subprocess, threading, time, urllib.request, uuid
+from datetime import datetime, timezone
 
 # 设置本机请求绕过 HTTP 代理（MacBook 上可能配了 Clash 环境变量）
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
@@ -370,6 +371,20 @@ def _auto_reply(output, sender_info):
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10):
             log(f"📤 自动回复 {len(reply_text)} chars 到 {target_host}")
+            # 记录到 outgoing_messages
+            try:
+                import sqlite3
+                db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+                conn = sqlite3.connect(db_path, timeout=3)
+                conn.execute(
+                    "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
+                    (str(uuid.uuid4()), target_host, f"{hostname} ({sender_nick})", reply_text,
+                     datetime.now(timezone.utc).isoformat())
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
     except Exception as e:
         log(f"⏰ 自动回复失败: {str(e)[:60]}")
 
