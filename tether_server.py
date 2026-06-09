@@ -83,6 +83,7 @@ def status():
     return jsonify({
         "hostname": HOSTNAME, "messages_pending": pending,
         "messages_unacked_outgoing": unacked, "time": _now(),
+        "tether_alive": True,  # 能响应 /status 说明 tether_server 自己活着
         "watcher_alive": watcher_alive,
         "watcher_pid": watcher_pid,
         "watcher_lag": round(watcher_lag, 1) if watcher_lag is not None else None,

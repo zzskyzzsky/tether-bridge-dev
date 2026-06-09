@@ -25,6 +25,7 @@ POLL_INTERVAL = 2
 # 同行 Tether 地址（对方 Hermes 实例，用于自动回复）
 PEER_HOST = os.environ.get("TETHER_PEER_HOST", "")
 PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
+PEER_FALLBACK_HOST = os.environ.get("TETHER_PEER_FALLBACK_HOST", "")
 TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key + DingTalk Webhook URL
@@ -395,11 +396,27 @@ def _write_report_to_file(content):
         pass
 
 
+def _try_post(peer_url, payload, timeout=10):
+    """尝试 POST 到指定 URL，返回 (success, error_msg)"""
+    try:
+        req = urllib.request.Request(peer_url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True, None
+    except Exception as e:
+        return False, str(e)[:100]
+
+
 def _auto_reply(output, sender_info):
     """自动回复：将 hermes -z / Gateway 的输出 POST 回发送方 Tether
 
     sender_info 是消息中的 sender 字段值，格式为 'hostname (nickname)'。
     从 sender_info 中提取 hostname，解析出对方的 Tether 地址。
+
+    多候选连接策略：
+    - 如果 TETHER_PEER_FALLBACK_HOST 设置了，构建 [PEER_HOST, FALLBACK_HOST] 候选列表
+    - 先试 PEER_HOST（VPS WG IP），失败后试 FALLBACK_HOST（Tailscale 直连）
+    - 只在首次失败时尝试 fallback，成功即停止
     """
     if not output or not sender_info:
         return
@@ -418,7 +435,10 @@ def _auto_reply(output, sender_info):
     if target_host == local_hostname:
         return
 
-    peer_url = f"http://{target_host}:{PEER_PORT}/message"
+    # 构建候选连接列表：[主路径, 回退路径]
+    candidates = [target_host]
+    if PEER_FALLBACK_HOST and PEER_FALLBACK_HOST != target_host and PEER_FALLBACK_HOST != local_hostname:
+        candidates.append(PEER_FALLBACK_HOST)
     hostname = __import__("socket").gethostname()
     sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
 
@@ -445,18 +465,22 @@ def _auto_reply(output, sender_info):
     except Exception:
         pass
 
-    try:
-        payload = json.dumps({
-            "from": f"{hostname} ({sender_nick})",
-            "sender": f"{hostname} ({sender_nick})",
-            "message": reply_text,
-            "content": reply_text,
-            "type": "auto_reply",
-        }).encode()
-        req = urllib.request.Request(peer_url, data=payload,
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10):
-            log(f"📤 自动回复 {len(reply_text)} chars 到 {target_host}")
+    payload = json.dumps({
+        "from": f"{hostname} ({sender_nick})",
+        "sender": f"{hostname} ({sender_nick})",
+        "message": reply_text,
+        "content": reply_text,
+        "type": "auto_reply",
+    }).encode()
+
+    # 遍历候选列表，逐个尝试
+    last_err_msg = ""
+    for i, candidate in enumerate(candidates):
+        peer_url = f"http://{candidate}:{PEER_PORT}/message"
+        ok, err = _try_post(peer_url, payload)
+        if ok:
+            used = "主路径" if i == 0 else f"回退路径（前次失败: {last_err_msg}）"
+            log(f"📤 自动回复 {len(reply_text)} chars 到 {candidate}（{used}）")
             # 记录到 outgoing_messages
             try:
                 import sqlite3
@@ -464,15 +488,18 @@ def _auto_reply(output, sender_info):
                 conn = sqlite3.connect(db_path, timeout=3)
                 conn.execute(
                     "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
-                    (str(uuid.uuid4()), target_host, f"{hostname} ({sender_nick})", reply_text,
+                    (str(uuid.uuid4()), candidate, f"{hostname} ({sender_nick})", reply_text,
                      datetime.now(timezone.utc).isoformat())
                 )
                 conn.commit()
                 conn.close()
             except Exception:
                 pass
-    except Exception as e:
-        log(f"⏰ 自动回复失败: {str(e)[:60]}")
+            return
+        last_err_msg = err or "unknown"
+        log(f"⚠️ 尝试 {candidate} 失败: {last_err_msg[:80]}")
+
+    log(f"❌ 所有路径都失败: {last_err_msg}")
 
 
 

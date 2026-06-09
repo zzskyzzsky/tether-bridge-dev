@@ -5,3 +5,4 @@ __pycache__/
 tether.db-shm
 tether.db-wal
 .env
+watcher_heartbeat.json
