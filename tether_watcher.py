@@ -471,6 +471,7 @@ def _auto_reply(output, sender_info):
         "message": reply_text,
         "content": reply_text,
         "type": "auto_reply",
+        "ttl": 1,  # auto_reply 也带 TTL，防止回环
     }).encode()
 
     # 遍历候选列表，逐个尝试
@@ -537,6 +538,21 @@ def process_messages():
             if msg.get("type") == "auto_reply":
                 log(f"\u23ed {mid} 跳过（auto_reply 类型，防止回环）")
                 continue
+
+            # TTL 防死循环：检查 relay 消息的 TTL
+            ttl = msg.get("ttl")
+            if ttl is not None:
+                if ttl <= 0:
+                    log(f"\u23ed {mid} 跳过（TTL={ttl}，已达零，防止消息循环）")
+                    continue
+                else:
+                    # TTL 减 1 后转发
+                    log(f"\u26a1 {mid} TTL={ttl} → TTL={ttl-1}")
+                    msg["ttl"] = ttl - 1
+            else:
+                # 没有 ttl 字段的旧消息，首次经过此 watcher 时设置 ttl=1
+                msg["ttl"] = 1
+                log(f"\u26a1 {mid} 首次经过，设置 TTL=1")
 
             # 去重过滤：连续确认循环消息直接跳过（同 sender、含确认关键词、N 分钟内重复）
             skip_keywords = ["已清理", "无积压", "无需操作", "不回复以阻断", "等主人回来",
