@@ -36,8 +36,8 @@ LISTEN_PORT = int(os.environ.get("RELAY_PORT", "9001"))
 # 对端地址（mac 的 Tether Server）
 RELAY_PEER = os.environ.get("RELAY_PEER", "http://100.81.192.38:9001")
 
-# 中继使用的 sender 标识
-RELAY_SENDER = os.environ.get("RELAY_SENDER", "relay")
+# 中继使用的 sender 标识 — 必须是 IP 或域名，让 watcher 能 POST 到对端
+RELAY_SENDER = os.environ.get("RELAY_SENDER", "154.8.143.218 (relay)")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether_relay.db")
 NOTIFY_FILE = "/tmp/tether_relay_notify.json"
