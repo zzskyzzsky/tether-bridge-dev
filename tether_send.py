@@ -166,36 +166,55 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
         "Content-Type": "application/json",
     })
 
-    for attempt in range(2):
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode())
-            msg_id = result.get("message_id", "?")
-            print(f"✅ [{msg_type}] → {target_host}:{port}  message_id={msg_id[:8]}")
-            # 记录到 outgoing_messages
-            try:
-                conn = sqlite3.connect(DB_PATH, timeout=3)
-                conn.execute(
-                    "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
-                    (msg_id, target_host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).isoformat())
-                )
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-            return True
-        except (urllib.error.URLError, urllib.error.HTTPError) as e:
-            err = str(e)
-            if attempt == 0:
-                print(f"⏳ 发送失败，重试一次... ({err[:60]})", file=sys.stderr)
-                continue
-            print(f"❌ 发送失败: {err}", file=sys.stderr)
-            return False
-        except Exception as e:
-            print(f"❌ 异常: {e}", file=sys.stderr)
-            return False
+    targets = [(target_host, port)]
+    # Tailscale fallback：如果主机名不是 IP，尝试 100.x.y.z 解析
+    try:
+        addr_info = socket.getaddrinfo(target_host, None, socket.AF_INET, socket.SOCK_STREAM)
+        tailscale_ips = [a[4][0] for a in addr_info if a[4][0].startswith("100.")]
+        for ip in tailscale_ips:
+            if ip != target_host:
+                targets.append((ip, port))
+    except socket.gaierror:
+        pass  # DNS 失败，无 fallback
 
-    return False
+    last_err = None
+    for host, p in targets:
+        url = f"http://{host}:{p}/message"
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    result = json.loads(resp.read().decode())
+                msg_id = result.get("message_id", "?")
+                print(f"✅ [{msg_type}] → {host}:{p}  message_id={msg_id[:8]}")
+                # 记录到 outgoing_messages
+                try:
+                    conn = sqlite3.connect(DB_PATH, timeout=3)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
+                        (msg_id, host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).isoformat())
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                return True
+            except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                err = str(e)
+                if attempt == 0:
+                    print(f"⏳ 发送失败，重试一次... ({err[:60]})", file=sys.stderr)
+                    last_err = err
+                    continue
+                last_err = err
+                print(f"⏳ {host}:{p} 失败: {err[:60]}", file=sys.stderr)
+                break  # 尝试下一个 target
+            except Exception as e:
+                print(f"⏳ {host}:{p} 异常: {e}", file=sys.stderr)
+                last_err = str(e)
+                break  # 尝试下一个 target
+
+    if last_err:
+        print(f"❌ 发送失败: {last_err}", file=sys.stderr)
+    return last_err is None
 
 
 def main():
