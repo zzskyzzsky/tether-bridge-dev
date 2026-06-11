@@ -623,8 +623,9 @@ def _auto_reply(output, sender_info):
     hostname = __import__("socket").gethostname()
     sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
 
-    # 只取输出前 4000 字符，防止过长
+    # 只取输出前 4000 字符；清理非法 surrogate 字符（json.dumps 对 surrogate 报错）
     reply_text = output[:4000]
+    reply_text = reply_text.encode("utf-8", errors="replace").decode("utf-8")
 
     # 防自动回复循环：检查最近 N 秒内是否给同一目标发过相同内容
     DEDUP_SECONDS = 30
@@ -840,7 +841,7 @@ def process_handoffs():
         _recover_next_handoff()
         return
 
-    log(f"\udccb 发现 handoff from={sender}: {summary[:60]}...")
+    log(f"📋 发现 handoff from={sender}: {summary[:60]}...")
 
     # 先删除 handoff 文件，防止重复处理
     try:
