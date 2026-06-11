@@ -78,7 +78,7 @@ def status():
         pass
 
     with _db() as conn:
-        pending = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0").fetchone()[0]
+        pending = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0 AND type='info'").fetchone()[0]
         unacked = conn.execute("SELECT COUNT(*) FROM outgoing_messages WHERE acked=0").fetchone()[0]
     return jsonify({
         "hostname": HOSTNAME, "messages_pending": pending,
