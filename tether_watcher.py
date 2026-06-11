@@ -65,6 +65,16 @@ def _get_full_nick(host):
             return n
     return host
 
+
+def _get_peer_nick():
+    """获取对端短名（mac/tp），用于唤醒消息"""
+    local = __import__("socket").gethostname().lower()
+    for h, n in _HOST_TO_NICK_SHORT.items():
+        if h != local:
+            return n
+    # fallback：从环境变量获取
+    return os.environ.get("TETHER_PEER_NICK", "对方")
+
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key + DingTalk Webhook URL
 API_KEY_ENV = os.environ.get("API_SERVER_KEY", "")
 GATEWAY_API_KEY = API_KEY_ENV.strip() if API_KEY_ENV else ""
@@ -81,6 +91,20 @@ if os.path.isfile(_env_path):
                     GATEWAY_API_KEY = line.split("=", 1)[1].strip()
                 elif line.startswith("DINGTALK_WEBHOOK_URL=") and not DINGTALK_WEBHOOK_URL:
                     DINGTALK_WEBHOOK_URL = line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+
+# 也尝试从 .env 读取飞书 pusher 配置（双重保险）
+# 注意：此时 FEISHU_PUSHER_WEBHOOK_URL 还未定义，直接用 os.environ
+if not os.environ.get("FEISHU_X_PUSHER_WEBHOOK_URL") and os.path.isfile(_env_path):
+    try:
+        with open(_env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("FEISHU_X_PUSHER_WEBHOOK_URL="):
+                    val = line.split("=", 1)[1].strip()
+                    os.environ["FEISHU_X_PUSHER_WEBHOOK_URL"] = val
+                    break
     except Exception:
         pass
 
@@ -352,7 +376,7 @@ def _check_feishu_wakeup():
         ).fetchall()
         if rows:
             for target_host, sender, message, sent_at in rows:
-                target_nick = _get_nick(target_host)
+                target_nick = _get_peer_nick()
                 # local_nick 使用 _HOST_TO_NICK 映射后的值，避免直接使用主机名
                 local_nick = _get_full_nick(__import__("socket").gethostname()) or __import__("socket").gethostname()
                 # 计算实际等待秒数
