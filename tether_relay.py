@@ -33,8 +33,10 @@ app = Flask(__name__)
 HOSTNAME = socket.gethostname()
 LISTEN_PORT = int(os.environ.get("RELAY_PORT", "9001"))
 
-# 对端地址（mac 的 Tether Server）
-RELAY_PEER = os.environ.get("RELAY_PEER", "http://100.81.192.38:9001")
+# TP 的 Tether Server（mac 发来的消息要转发给 TP）
+RELAY_TP = os.environ.get("RELAY_TP", "http://100.102.54.90:9001")
+# mac 的 Tether Server（TP 发来的消息要转发给 mac）
+RELAY_MAC = os.environ.get("RELAY_MAC", "http://100.81.192.38:9001")
 
 # 中继使用的 sender 标识 — 必须是 IP 或域名，让 watcher 能 POST 到对端
 RELAY_SENDER = os.environ.get("RELAY_SENDER", "154.8.143.218 (relay)")
@@ -84,13 +86,14 @@ def _write_notify(preview, count):
         pass
 
 
-def forward_to_peer(data):
-    """将消息转发给对端（mac）"""
+def forward_to_peer(data, sender_id):
+    """将消息转发给对端 — 根据 sender_id 决定发往 TP 还是 mac"""
     global message_count
+    target = RELAY_TP if sender_id == "tp" else RELAY_MAC
     try:
         payload = json.dumps(data, ensure_ascii=False).encode()
         req = Request(
-            RELAY_PEER + "/message",
+            target + "/message",
             data=payload,
             headers={"Content-Type": "application/json"},
         )
@@ -98,7 +101,7 @@ def forward_to_peer(data):
         message_count += 1
         return True
     except Exception as e:
-        print(f"⚠️ Forward failed: {e}", file=sys.stderr)
+        print(f"⚠️ Forward to {target} failed: {e}", file=sys.stderr)
         return False
 
 
@@ -107,7 +110,8 @@ def health():
     return jsonify({
         "status": "ok",
         "hostname": HOSTNAME,
-        "relay_peer": RELAY_PEER,
+        "relay_tp": RELAY_TP,
+        "relay_mac": RELAY_MAC,
         "messages": message_count,
         "uptime": round(time.time() - last_health.get("_start", time.time())),
     }), 200
@@ -136,7 +140,8 @@ def status():
         ).fetchone()[0]
     return jsonify({
         "hostname": HOSTNAME,
-        "relay_peer": RELAY_PEER,
+        "relay_tp": RELAY_TP,
+        "relay_mac": RELAY_MAC,
         "messages_pending": pending,
         "messages_total": message_count,
         "watcher_alive": watcher_alive,

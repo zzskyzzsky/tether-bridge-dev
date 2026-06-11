@@ -64,6 +64,65 @@ _DINGTALK_DEDUP_CACHE = {}  # content_hash -> timestamp
 _DINGTALK_DEDUP_SECS = 30
 DINGTALK_LOG_ONLY = False  # 正式通知，真实 POST 到钉钉群
 
+# 飞书 pusher 唤醒（超时未回复时发群消息唤醒对方）
+FEISHU_PUSHER_OPEN_ID = os.environ.get("FEISHU_X_PUSHER_ID", "")
+FEISHU_PUSHER_WEBHOOK_URL = os.environ.get("FEISHU_X_PUSHER_WEBHOOK_URL", "")
+# 超时秒数：发出 auto_reply 后 N 秒未收到对方回复，触发 webhook 唤醒
+FEISHU_WAKEUP_TIMEOUT = int(os.environ.get("FEISHU_WAKEUP_TIMEOUT", "300"))
+# 去重：同一目标同一内容 N 秒内不重复发 webhook
+FEISHU_WAKEUP_DEDUP_SECS = 300
+_FEISHU_WAKEUP_DEDUP_CACHE = {}  # (target, content_hash) -> timestamp
+
+
+def _send_feishu_wakeup(target_nick, local_nick, content):
+    """通过 pusher_bot webhook 发群消息唤醒对方
+
+    只有 FEISHU_PUSHER_WEBHOOK_URL 已配置时才发送。
+    包含去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发送。
+    """
+    if not FEISHU_PUSHER_WEBHOOK_URL:
+        return
+    if not content:
+        return
+
+    # 去重检查
+    content_hash = __import__("hashlib").md5(content.encode()).hexdigest()
+    dedup_key = (target_nick, content_hash)
+    now = time.time()
+    if dedup_key in _FEISHU_WAKEUP_DEDUP_CACHE:
+        if now - _FEISHU_WAKEUP_DEDUP_CACHE[dedup_key] < FEISHU_WAKEUP_DEDUP_SECS:
+            log(f"⏭️ 跳过重复 feishu wakeup（{FEISHU_WAKEUP_DEDUP_SECS}s 内相同目标+内容 {content_hash[:8]}）")
+            return
+    _FEISHU_WAKEUP_DEDUP_CACHE[dedup_key] = now
+    # 定期清理过期缓存
+    if len(_FEISHU_WAKEUP_DEDUP_CACHE) > 50:
+        cutoff = now - FEISHU_WAKEUP_DEDUP_SECS
+        for k in list(_FEISHU_WAKEUP_DEDUP_CACHE.keys()):
+            if _FEISHU_WAKEUP_DEDUP_CACHE[k] < cutoff:
+                del _FEISHU_WAKEUP_DEDUP_CACHE[k]
+
+    wakeup_text = f"[唤醒] 我是{local_nick}，我在 tether 上等待你的回复，已经等待了 {FEISHU_WAKEUP_TIMEOUT // 60} 分钟。"
+    log(f"📢 通过 pusher_bot 发送 wakeup 到 {target_nick}: {wakeup_text}")
+
+    try:
+        req = urllib.request.Request(
+            FEISHU_PUSHER_WEBHOOK_URL,
+            data=json.dumps({
+                "msg_type": "text",
+                "content": {"text": wakeup_text},
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        if result.get("code") == 0:
+            log(f"✅ pusher_bot webhook 发送成功")
+        else:
+            log(f"⚠️ pusher_bot 返回错误: {result.get('msg', 'unknown')}")
+    except Exception as e:
+        log(f"❌ pusher_bot POST 失败: {str(e)[:80]}")
+
 # OOM 自愈计数器：按 msg_id 跟踪连续 OOM
 _OOM_COUNTER = {}  # {msg_id: [count, timestamp]}
 _OOM_WINDOW = 300  # 5分钟窗口，超时重置
@@ -215,10 +274,53 @@ def _tether_restart():
 
 
 def _self_heal():
-    """自愈巡检：Gateway 健康检查 + 自动重启"""
+    """自愈巡检：Gateway 健康检查 + 自动重启 + feishu wakeup 超时检查"""
     _ensure_gateway_alive()
     if not _tether_healthy():
         log("⚠️ Tether 不可达（由 systemd Restart=always 负责恢复）")
+    _check_feishu_wakeup()
+
+
+def _check_feishu_wakeup():
+    """检查 outgoing_messages 中是否有超时未收到回复的记录，触发 wakeup
+
+    检查逻辑：遍历 outgoing_messages 中 acked=0 的记录，
+    如果发送时间超过 FEISHU_WAKEUP_TIMEOUT 秒，说明对方没回复，
+    通过 pusher_bot webhook 发送唤醒消息到群里。
+    去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发。
+    """
+    if not FEISHU_PUSHER_WEBHOOK_URL:
+        return
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        conn = sqlite3.connect(db_path, timeout=3)
+        # 查找超时未 ack 的出站消息
+        rows = conn.execute(
+            "SELECT target_host, sender, message FROM outgoing_messages "
+            "WHERE acked=0 AND sent_at < datetime('now', ? || ' seconds', 'utc')",
+            (f"-{FEISHU_WAKEUP_TIMEOUT}",)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return
+        for target_host, sender, message in rows:
+            # sender 格式: "hostname (nickname)"
+            sender_nick = sender.split(" (", 1)[1].rstrip(")") if " (" in sender else sender
+            local_nick = os.environ.get("TETHER_SENDER_NICK", "") or __import__("socket").gethostname()
+            _send_feishu_wakeup(sender_nick, local_nick, message)
+            # 发送后立即 ack，避免重复触发
+            try:
+                import sqlite3 as _sql
+                _db = _sql.connect(db_path, timeout=3)
+                _db.execute("UPDATE outgoing_messages SET acked=1 WHERE target_host=? AND message=?",
+                            (target_host, message))
+                _db.commit()
+                _db.close()
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"feishu wakeup 检查异常: {str(e)[:80]}")
 
 
 def _tether_get(path):

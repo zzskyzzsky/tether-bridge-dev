@@ -160,6 +160,7 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
         "message": message,
         "content": message,
         "type": msg_type,
+        "ttl": 2,  # 每跳减1，0则丢弃，防止中继环路
     }).encode()
 
     req = urllib.request.Request(url, data=payload, headers={
