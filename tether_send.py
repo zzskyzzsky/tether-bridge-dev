@@ -191,7 +191,7 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
                 try:
                     conn = sqlite3.connect(DB_PATH, timeout=3)
                     conn.execute(
-                        "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
+                        "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,0)",
                         (msg_id, host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).isoformat())
                     )
                     conn.commit()

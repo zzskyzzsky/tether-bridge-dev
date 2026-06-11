@@ -588,11 +588,14 @@ def _try_post(peer_url, payload, timeout=10):
         return False, str(e)[:100]
 
 
-def _auto_reply(output, sender_info):
+def _auto_reply(output, sender_info, original_msg_id=None):
     """自动回复：将 hermes -z / Gateway 的输出 POST 回发送方 Tether
 
     sender_info 是消息中的 sender 字段值，格式为 'hostname (nickname)'。
     从 sender_info 中提取 hostname，解析出对方的 Tether 地址。
+
+    如果提供了 original_msg_id，会在 payload 中带上 in_reply_to，
+    对方 server 收到后自动 ack 对应的 outgoing_messages。
 
     多候选连接策略：
     - 如果 TETHER_PEER_FALLBACK_HOST 设置了，构建 [PEER_HOST, FALLBACK_HOST] 候选列表
@@ -655,6 +658,13 @@ def _auto_reply(output, sender_info):
         "type": "auto_reply",
         "ttl": 1,  # auto_reply 也带 TTL，防止回环
     }).encode()
+
+    # 如果有 original_msg_id，payload 中带 in_reply_to 字段
+    # 对方 server 收到后会自动 ack 对应的 outgoing_messages
+    if original_msg_id:
+        payload_obj = json.loads(payload.decode())
+        payload_obj["in_reply_to"] = original_msg_id
+        payload = json.dumps(payload_obj).encode()
 
     # 遍历候选列表，逐个尝试
     last_err_msg = ""
@@ -795,7 +805,7 @@ def process_messages():
                     _send_dingtalk(output)
 
                 # 所有消息都 auto-reply 回发送方
-                _auto_reply(output, sender)
+                _auto_reply(output, sender, msg.get("id", ""))
 
         log(f"✅ 本轮处理完成 ({len(msgs)} 条)")
         return len(msgs)
@@ -894,7 +904,7 @@ def process_handoffs():
                 _send_dingtalk(output)
 
             # 所有消息都 auto-reply 回发送方
-            _auto_reply(output, sender)
+            _auto_reply(output, sender, msg_id)
 
         # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
         # OOM 时跳过 ack — 让未达阈值的 OOM 能被 recover 重试，达阈值的 OOM 已在 _detect_oom 内部 ack
