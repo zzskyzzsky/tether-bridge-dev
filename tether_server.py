@@ -104,7 +104,11 @@ def receive():
             "INSERT INTO messages (id, sender, message, received_at, type, acked) VALUES (?,?,?,?,?,0)",
             (msg_id, sender, content, _now(), msg_type))
 
-    if msg_type == "handoff":
+    if msg_type == "auto_reply":
+        # auto_reply：存但立即 acked（只是 audit trail，不需要 watcher 处理）
+        with _db() as conn:
+            conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
+    elif msg_type == "handoff":
         # handoff：存 SQLite + 写 handoff 文件，不触发 Watcher notify
         # watcher 在主轮询中独立检查 handoff 文件
         try:
