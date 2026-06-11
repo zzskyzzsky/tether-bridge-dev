@@ -28,6 +28,25 @@ PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
 PEER_FALLBACK_HOST = os.environ.get("TETHER_PEER_FALLBACK_HOST", "")
 TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
+# host -> nick 映射（共享代码，两边通用）
+_HOST_TO_NICK = {
+    "zzsky-mbp": "mac-弟弟",
+    "zzskytpg3": "tp-哥哥",
+}
+
+
+def _get_nick(host):
+    """从映射或环境变量获取指定主机的 nick"""
+    if not host:
+        return host
+    if host in _HOST_TO_NICK:
+        return _HOST_TO_NICK[host]
+    # 回退：环境变量 TETHER_PEER_NICK 如果设置且 host 匹配 PEER_HOST
+    peer_nick = os.environ.get("TETHER_PEER_NICK", "")
+    if PEER_HOST == host and peer_nick:
+        return peer_nick
+    return host
+
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key + DingTalk Webhook URL
 API_KEY_ENV = os.environ.get("API_SERVER_KEY", "")
 GATEWAY_API_KEY = API_KEY_ENV.strip() if API_KEY_ENV else ""
@@ -305,10 +324,9 @@ def _check_feishu_wakeup():
         if not rows:
             return
         for target_host, sender, message in rows:
-            # sender 格式: "hostname (nickname)"
-            sender_nick = sender.split(" (", 1)[1].rstrip(")") if " (" in sender else sender
+            target_nick = _get_nick(target_host)
             local_nick = os.environ.get("TETHER_SENDER_NICK", "") or __import__("socket").gethostname()
-            _send_feishu_wakeup(sender_nick, local_nick, message)
+            _send_feishu_wakeup(target_nick, local_nick, message)
             # 发送后立即 ack，避免重复触发
             try:
                 import sqlite3 as _sql
