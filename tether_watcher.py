@@ -28,23 +28,41 @@ PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
 PEER_FALLBACK_HOST = os.environ.get("TETHER_PEER_FALLBACK_HOST", "")
 TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
-# host -> nick 映射（共享代码，两边通用）
-_HOST_TO_NICK = {
+# host -> 短名映射（target_nick：mac/tp）
+_HOST_TO_NICK_SHORT = {
+    "zzsky-mbp": "mac",
+    "zzskytpg3": "tp",
+}
+
+# host -> 全名映射（local_nick：tp-哥哥/mac-弟弟）
+_HOST_TO_NICK_FULL = {
     "zzsky-mbp": "mac-弟弟",
     "zzskytpg3": "tp-哥哥",
 }
 
 
 def _get_nick(host):
-    """从映射或环境变量获取指定主机的 nick"""
+    """从映射获取指定主机的短名（mac/tp），用于 target_nick"""
     if not host:
         return host
-    if host in _HOST_TO_NICK:
-        return _HOST_TO_NICK[host]
-    # 回退：环境变量 TETHER_PEER_NICK 如果设置且 host 匹配 PEER_HOST
+    host_lower = host.lower()
+    for h, n in _HOST_TO_NICK_SHORT.items():
+        if h == host_lower:
+            return n
     peer_nick = os.environ.get("TETHER_PEER_NICK", "")
-    if PEER_HOST == host and peer_nick:
+    if PEER_HOST and host == PEER_HOST and peer_nick:
         return peer_nick
+    return host
+
+
+def _get_full_nick(host):
+    """从映射获取指定主机的全名（tp-哥哥/mac-弟弟），用于 local_nick"""
+    if not host:
+        return host
+    host_lower = host.lower()
+    for h, n in _HOST_TO_NICK_FULL.items():
+        if h == host_lower:
+            return n
     return host
 
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key + DingTalk Webhook URL
@@ -93,16 +111,22 @@ FEISHU_WAKEUP_DEDUP_SECS = 300
 _FEISHU_WAKEUP_DEDUP_CACHE = {}  # (target, content_hash) -> timestamp
 
 
-def _send_feishu_wakeup(target_nick, local_nick, content):
+def _send_feishu_wakeup(target_nick, local_nick, content, elapsed_seconds=None):
     """通过 pusher_bot webhook 发群消息唤醒对方
 
     只有 FEISHU_PUSHER_WEBHOOK_URL 已配置时才发送。
     包含去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发送。
+    elapsed_seconds: 实际等待秒数（从 sent_at/received_at 到现在的秒数），如果不传则用 FEISHU_WAKEUP_TIMEOUT。
     """
     if not FEISHU_PUSHER_WEBHOOK_URL:
         return
     if not content:
         return
+
+    # 计算实际等待分钟数
+    if elapsed_seconds is None:
+        elapsed_seconds = FEISHU_WAKEUP_TIMEOUT
+    elapsed_minutes = int(elapsed_seconds / 60)
 
     # 去重检查
     content_hash = __import__("hashlib").md5(content.encode()).hexdigest()
@@ -120,7 +144,7 @@ def _send_feishu_wakeup(target_nick, local_nick, content):
             if _FEISHU_WAKEUP_DEDUP_CACHE[k] < cutoff:
                 del _FEISHU_WAKEUP_DEDUP_CACHE[k]
 
-    wakeup_text = f"[唤醒] 我是{local_nick}，我在 tether 上等待你的回复，已经等待了 {FEISHU_WAKEUP_TIMEOUT // 60} 分钟。"
+    wakeup_text = f"[呼叫{target_nick}] 我是{local_nick}，请你尽快去检查你的tether信息，我在 tether 上等待你的回复，已经等待了 {elapsed_minutes} 分钟。"
     log(f"📢 通过 pusher_bot 发送 wakeup 到 {target_nick}: {wakeup_text}")
 
     try:
@@ -301,11 +325,16 @@ def _self_heal():
 
 
 def _check_feishu_wakeup():
-    """检查 outgoing_messages 中是否有超时未收到回复的记录，触发 wakeup
+    """检查 outgoing_messages 和 incoming_messages 中是否有超时未回复的记录，触发 wakeup
 
-    检查逻辑：遍历 outgoing_messages 中 acked=0 的记录，
-    如果发送时间超过 FEISHU_WAKEUP_TIMEOUT 秒，说明对方没回复，
+    检查逻辑1（出站）：遍历 outgoing_messages 中 acked=0 的记录，
+    如果发送时间超过 FEISHU_WAKEUP_TIMEOUT 秒，说明对方没 ack，
     通过 pusher_bot webhook 发送唤醒消息到群里。
+
+    检查逻辑2（入站回复超时）：遍历 incoming messages 中对方发的消息（非auto_reply），
+    如果超过 FEISHU_WAKEUP_TIMEOUT 秒我没有回复（即没有对应的 outgoing_messages 回复），
+    说明对方等太久，通过 pusher_bot webhook 发送唤醒消息到群里。
+
     去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发。
     """
     if not FEISHU_PUSHER_WEBHOOK_URL:
@@ -314,29 +343,61 @@ def _check_feishu_wakeup():
         import sqlite3
         db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
         conn = sqlite3.connect(db_path, timeout=3)
-        # 查找超时未 ack 的出站消息
+
+        # 检查逻辑1：出站消息超时未 ack
         rows = conn.execute(
-            "SELECT target_host, sender, message FROM outgoing_messages "
+            "SELECT target_host, sender, message, sent_at FROM outgoing_messages "
             "WHERE acked=0 AND julianday(sent_at) < julianday('now', ? || ' seconds')",
             (f"-{FEISHU_WAKEUP_TIMEOUT}",)
         ).fetchall()
+        if rows:
+            for target_host, sender, message, sent_at in rows:
+                target_nick = _get_nick(target_host)
+                # local_nick 使用 _HOST_TO_NICK 映射后的值，避免直接使用主机名
+                local_nick = _get_full_nick(__import__("socket").gethostname()) or __import__("socket").gethostname()
+                # 计算实际等待秒数
+                now_epoch = time.time()
+                sent_epoch = (datetime.fromisoformat(sent_at.replace("Z", "+00:00")) - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()
+                elapsed = int(now_epoch - sent_epoch)
+                _send_feishu_wakeup(target_nick, local_nick, message, elapsed_seconds=elapsed)
+                try:
+                    _db = sqlite3.connect(db_path, timeout=3)
+                    _db.execute("UPDATE outgoing_messages SET acked=1 WHERE target_host=? AND message=?",
+                                (target_host, message))
+                    _db.commit()
+                    _db.close()
+                except Exception:
+                    pass
+
+        # 检查逻辑2：入站消息超时未回复（双向对话超时检测）
+        local_hostname = __import__("socket").gethostname()
+        local_nick = _get_full_nick(local_hostname) or local_hostname
+        # 查询超时的入站消息，过滤掉自己hostname发来的消息
+        rows2 = conn.execute(
+            "SELECT id, sender, message, received_at FROM messages "
+            "WHERE acked=1 AND type != 'handoff' AND type != 'auto_reply' "
+            "AND julianday(received_at) < julianday('now', ? || ' seconds') "
+            "AND sender NOT LIKE ? "
+            "ORDER BY received_at ASC LIMIT 10",
+            (f"-{FEISHU_WAKEUP_TIMEOUT}", f"%{local_hostname}%")
+        ).fetchall()
+        if rows2:
+            for msg_id, sender, message, received_at in rows2:
+                # 确定对方主机
+                sender_host = sender.split()[0] if " " in sender else sender.split("@")[-1]
+                target_nick = _get_nick(sender_host)
+                # 检查是否已有 outgoing_messages 回复过（收到对方消息之后发的）
+                reply_exists = conn.execute(
+                    "SELECT COUNT(*) FROM outgoing_messages "
+                    "WHERE julianday(sent_at) >= julianday(?)",
+                    (received_at,)
+                ).fetchone()[0] > 0
+                if not reply_exists:
+                    # 计算实际等待秒数（从对方发消息到现在）
+                    received_epoch = (datetime.fromisoformat(received_at.replace("Z", "+00:00")) - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()
+                    elapsed = int(time.time() - received_epoch)
+                    _send_feishu_wakeup(target_nick, local_nick, f"等待回复超时: {message[:100]}", elapsed_seconds=elapsed)
         conn.close()
-        if not rows:
-            return
-        for target_host, sender, message in rows:
-            target_nick = _get_nick(target_host)
-            local_nick = os.environ.get("TETHER_SENDER_NICK", "") or __import__("socket").gethostname()
-            _send_feishu_wakeup(target_nick, local_nick, message)
-            # 发送后立即 ack，避免重复触发
-            try:
-                import sqlite3 as _sql
-                _db = _sql.connect(db_path, timeout=3)
-                _db.execute("UPDATE outgoing_messages SET acked=1 WHERE target_host=? AND message=?",
-                            (target_host, message))
-                _db.commit()
-                _db.close()
-            except Exception:
-                pass
     except Exception as e:
         log(f"feishu wakeup 检查异常: {str(e)[:80]}")
 
