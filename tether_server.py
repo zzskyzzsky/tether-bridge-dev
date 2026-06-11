@@ -108,6 +108,12 @@ def receive():
         # auto_reply：存但立即 acked（只是 audit trail，不需要 watcher 处理）
         with _db() as conn:
             conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
+        # 检查是否有 in_reply_to，自动 ack 对方的 outgoing_messages
+        in_reply_to = data.get("in_reply_to")
+        if in_reply_to:
+            with _db() as conn:
+                conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (in_reply_to,))
+            print(f"✅ auto_reply in_reply_to={in_reply_to[:8]} → outgoing acked")
     elif msg_type == "handoff":
         # handoff：存 SQLite + 写 handoff 文件，不触发 Watcher notify
         # watcher 在主轮询中独立检查 handoff 文件
@@ -121,19 +127,6 @@ def receive():
                 }, f)
         except Exception:
             pass
-    elif msg_type == "auto_reply":
-        # auto_reply 只是确认回执，不需要 watcher 排队处理
-        # 立即 ack（线上面 INSERT 的 acked=0 是 info/handoff 的默认值）
-        conn = _db()
-        conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
-        conn.close()
-        # 检查是否有 in_reply_to，自动 ack 对方的 outgoing_messages
-        in_reply_to = data.get("in_reply_to")
-        if in_reply_to:
-            conn = _db()
-            conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (in_reply_to,))
-            conn.close()
-            print(f"✅ auto_reply in_reply_to={in_reply_to[:8]} → outgoing acked")
     else:
         # info 消息：正常触发 Watcher
         with _db() as conn:
