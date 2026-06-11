@@ -384,14 +384,6 @@ def _check_feishu_wakeup():
                 sent_epoch = (datetime.fromisoformat(sent_at.replace("Z", "+00:00")) - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()
                 elapsed = int(now_epoch - sent_epoch)
                 _send_feishu_wakeup(target_nick, local_nick, message, elapsed_seconds=elapsed)
-                try:
-                    _db = sqlite3.connect(db_path, timeout=3)
-                    _db.execute("UPDATE outgoing_messages SET acked=1 WHERE target_host=? AND message=?",
-                                (target_host, message))
-                    _db.commit()
-                    _db.close()
-                except Exception:
-                    pass
 
         # 检查逻辑2：入站消息超时未回复（双向对话超时检测）
         local_hostname = __import__("socket").gethostname()
