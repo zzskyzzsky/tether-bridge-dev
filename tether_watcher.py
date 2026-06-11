@@ -317,7 +317,7 @@ def _check_feishu_wakeup():
         # 查找超时未 ack 的出站消息
         rows = conn.execute(
             "SELECT target_host, sender, message FROM outgoing_messages "
-            "WHERE acked=0 AND sent_at < datetime('now', ? || ' seconds', 'utc')",
+            "WHERE acked=0 AND julianday(sent_at) < julianday('now', ? || ' seconds')",
             (f"-{FEISHU_WAKEUP_TIMEOUT}",)
         ).fetchall()
         conn.close()
