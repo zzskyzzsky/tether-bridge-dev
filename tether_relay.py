@@ -40,6 +40,7 @@ RELAY_MAC = os.environ.get("RELAY_MAC", "http://100.81.192.38:9001")
 
 # 中继使用的 sender 标识 — 必须是 IP 或域名，让 watcher 能 POST 到对端
 RELAY_SENDER = os.environ.get("RELAY_SENDER", "154.8.143.218 (relay)")
+RELAY_PEER = os.environ.get("RELAY_PEER", "http://100.81.192.38:9001")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether_relay.db")
 NOTIFY_FILE = "/tmp/tether_relay_notify.json"
@@ -89,7 +90,10 @@ def _write_notify(preview, count):
 def forward_to_peer(data, sender_id):
     """将消息转发给对端 — 根据 sender_id 决定发往 TP 还是 mac"""
     global message_count
-    target = RELAY_TP if sender_id == "tp" else RELAY_MAC
+    # 匹配各种 sender 格式：tp, tp-哥哥, tp-测试, mac, mac-弟弟, zzskytpg3, zzsky-mbp
+    sender_lower = str(sender_id).lower()
+    is_from_tp = any(kw in sender_lower for kw in ["tp", "zzskytpg3", "zzskytpg"])
+    target = RELAY_MAC if is_from_tp else RELAY_TP
     try:
         payload = json.dumps(data, ensure_ascii=False).encode()
         req = Request(
@@ -163,6 +167,9 @@ def receive():
 
     msg_id = str(uuid.uuid4())
 
+    # 保存原始 sender 用于路由判断（被 RELAY_SENDER 覆盖前）
+    original_sender = sender
+
     # 修改 sender 为 relay 标识（让对端的 watcher 发到 TETHER_PEER_HOST）
     data["sender"] = RELAY_SENDER
     data["from"] = RELAY_SENDER
@@ -194,8 +201,8 @@ def receive():
             ).fetchone()[0]
         _write_notify(content, cnt)
 
-    # 转发给对端
-    ok = forward_to_peer(data)
+    # 转发给对端（用原始 sender 决定路由：tp→mac, mac/其他→tp）
+    ok = forward_to_peer(data, original_sender)
 
     return jsonify({"status": "ok", "message_id": msg_id, "forwarded": ok})
 

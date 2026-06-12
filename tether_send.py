@@ -46,10 +46,12 @@ def print_usage():
     print("", file=sys.stderr)
     print("选项:", file=sys.stderr)
     print("  --help              显示此帮助", file=sys.stderr)
-    print("  --host, -h <主机>   目标主机（Tailscale 主机名或 IP）", file=sys.stderr)
+    print("  --host, -h <主机>   目标主机（Tailscale 主机名/IP/URL，也支持 http://host:port）", file=sys.stderr)
     print("  --port, -p <端口>   目标端口（默认 9001）", file=sys.stderr)
     print("  --type, -t <类型>   消息类型: info（默认）| handoff", file=sys.stderr)
     print("  --nick <昵称>       发送方昵称（覆盖环境变量 TETHER_SENDER_NICK）", file=sys.stderr)
+    print("  --peer <主机>       目标主机（--host 的别名，与 relay 脚本一致）", file=sys.stderr)
+    print("  --identity <昵称>   发送方昵称（--nick 的别名）", file=sys.stderr)
     print("", file=sys.stderr)
     print("环境变量:", file=sys.stderr)
     print(f"  {ENV_HOST_KEY}     默认目标主机", file=sys.stderr)
@@ -102,6 +104,20 @@ def parse_args():
                 print("❌ --nick 缺少参数值", file=sys.stderr)
                 sys.exit(1)
             nick = args[i]
+        elif args[i] == "--peer":
+            # --peer 是 --host 别名（relay 脚本使用）
+            i += 1
+            if i >= len(args):
+                print("❌ --peer 缺少参数值", file=sys.stderr)
+                sys.exit(1)
+            host = args[i]
+        elif args[i] == "--identity":
+            # --identity 是 --nick 别名
+            i += 1
+            if i >= len(args):
+                print("❌ --identity 缺少参数值", file=sys.stderr)
+                sys.exit(1)
+            nick = args[i]
         else:
             # 白名单：只认 --host/--type/--port/--nick，其余 --xxx 跳过自身和下一个 token
             if args[i].startswith("-"):
@@ -133,7 +149,15 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
         print("⚠️ 空消息，跳过发送", file=sys.stderr)
         sys.exit(0)
 
-    # 解析 host（支持 hostname/Tailscale MagicDNS，不包含 port）
+    # 解析 host（支持 hostname/Tailscale MagicDNS、URL 格式 http://host:port）
+    # 去掉 http:// 或 https:// 前缀
+    if host.lower().startswith("http://"):
+        host = host[7:]
+    elif host.lower().startswith("https://"):
+        host = host[8:]
+    # 去掉末尾 /
+    host = host.rstrip("/")
+
     if port is None:
         if ":" in host:
             target_host, port_str = host.rsplit(":", 1)
@@ -192,7 +216,7 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
                     conn = sqlite3.connect(DB_PATH, timeout=3)
                     conn.execute(
                         "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,0)",
-                        (msg_id, host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).isoformat())
+                        (msg_id, host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
                     )
                     conn.commit()
                     conn.close()
