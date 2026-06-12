@@ -907,9 +907,10 @@ def _write_handoff_result(sender, summary, output):
 
 
 def process_handoffs():
-    """检查 handoff 文件，有内容就通过 hermes -z 处理（需要工具执行能力）
+    """检查 handoff 文件，有内容就通过 Gateway API 处理
 
-    通过子线程运行 hermes -z，不阻塞主循环（info 消息处理不受影响）。
+    通过子线程调用 _gateway_chat()，不阻塞主循环（info 消息处理不受影响）。
+    替代了原来的 hermes -z 子进程方案，不再有 OOM 风险。
     处理完成后自动回复到发送方。
     """
     if not os.path.isfile(HANDOFF_FILE):
@@ -951,47 +952,30 @@ def process_handoffs():
 
     msg_id = handoff.get("msg_id", "")
 
-    # 子线程运行 hermes -z，不阻塞主循环
+    # 子线程调用 Gateway API，不阻塞主循环
     def _run_handoff(sender=sender, msg_id=msg_id):
         output = None
-        oom_detected = False
         try:
-            cmd = _get_hermes_args(prompt)
-            if not cmd:
-                log("❌ 找不到 hermes CLI，handoff 跳过")
-                return
-            r = subprocess.run(
-                cmd,
-                capture_output=True, text=True, timeout=300,
-                preexec_fn=_limit_memory
-            )
-            if _detect_oom(r.returncode, msg_id):
-                # OOM 事件已由 _detect_oom 处理（计数 + 达阈值内部 ack + 重启）
-                oom_detected = True
-            elif r.returncode == 0 and r.stdout.strip():
-                output = r.stdout.strip()
+            output, error = _gateway_chat(prompt)
+            if output:
                 log(f"✅ Handoff 处理完成 ({len(output)} chars)")
                 _write_handoff_result(sender, summary[:40], output[:500])
             else:
-                log(f"⚠️ Handoff 完成但无输出 (rc={r.returncode})")
-        except subprocess.TimeoutExpired:
-            log(f"⏰ Handoff 超时 (300s)")
+                log(f"⚠️ Handoff Gateway 无输出: {error[:80] if error else 'unknown'}")
         except Exception as e:
             log(f"❌ Handoff 异常: {str(e)[:80]}")
 
-        # Handoff 处理结果：Report 走 DingTalk，所有消息都 auto-reply 回发送方
+        # Handoff 处理结果：Report 走通知，所有消息都 auto-reply 回发送方
         if output and sender:
             if _should_report(output):
-                log(f"🔔 Handoff [{msg_id[:8]}] 标记为 Report → 走 DingTalk 通知")
+                log(f"🔔 Handoff [{msg_id[:8]}] 标记为 Report → 走通知")
                 _send_dingtalk(output)
 
             # 所有消息都 auto-reply 回发送方
             _auto_reply(output, sender, msg_id)
 
         # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
-        # OOM 时跳过 ack — 让未达阈值的 OOM 能被 recover 重试，达阈值的 OOM 已在 _detect_oom 内部 ack
-        if not oom_detected:
-            _ack_handoff(msg_id)
+        _ack_handoff(msg_id)
 
         # 处理完一条后尝试恢复下一条积压 handoff
         _recover_next_handoff()
