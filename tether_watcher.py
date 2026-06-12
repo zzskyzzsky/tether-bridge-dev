@@ -264,8 +264,9 @@ def _tether_restart():
 
 
 def _self_heal():
-    """自愈巡检：Gateway 健康检查 + 自动重启"""
+    """自愈巡检：Gateway 健康检查 + outgoing 重试 + 自动重启"""
     _ensure_gateway_alive()
+    _check_outgoing_retry()
     if not _tether_healthy():
         log("⚠️ Tether 不可达（由 systemd Restart=always 负责恢复）")
 
@@ -561,6 +562,21 @@ def _auto_reply(output, sender_info, original_msg_id=None):
         log(f"⚠️ 尝试 {candidate} 失败: {last_err_msg[:80]}")
 
     log(f"❌ 所有路径都失败: {last_err_msg}")
+    # 写入 outgoing_messages（acked=0），供 _check_outgoing_retry 后续重试
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.execute(
+            "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,0)",
+            (str(uuid.uuid4()), target_host, f"{hostname} ({sender_nick})", reply_text,
+             datetime.now(timezone.utc).isoformat())
+        )
+        conn.commit()
+        conn.close()
+        log(f"📝 已记录失败 auto-reply 到 outgoing 队列（等待重试）")
+    except Exception:
+        pass
 
 
 
@@ -739,6 +755,49 @@ def process_handoffs():
     t = threading.Thread(target=_run_handoff, daemon=True)
     t.start()
     log("🔀 Handoff 已交给子线程处理，继续轮询")
+
+
+def _check_outgoing_retry():
+    """检查 outgoing_messages 中 acked=0 且超过 30 秒的消息，自动重试"""
+    try:
+        import sqlite3
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        conn = sqlite3.connect(db_path, timeout=3)
+        rows = conn.execute(
+            "SELECT id, target_host, message, sender FROM outgoing_messages "
+            "WHERE acked=0 AND sent_at < datetime('now', '-30 seconds', 'utc') "
+            "ORDER BY sent_at ASC LIMIT 5"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return
+
+    for msg_id, target_host, msg_text, sender in rows:
+        hostname = __import__("socket").gethostname()
+        sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
+        payload = json.dumps({
+            "from": f"{hostname} ({sender_nick})",
+            "sender": f"{hostname} ({sender_nick})",
+            "message": msg_text,
+            "content": msg_text,
+            "type": "auto_reply",
+            "ttl": 1,
+        }).encode()
+        peer_url = f"http://{target_host}:{PEER_PORT}/message"
+        ok, err = _try_post(peer_url, payload)
+        if ok:
+            try:
+                conn = sqlite3.connect(db_path, timeout=3)
+                conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (msg_id,))
+                conn.commit()
+                conn.close()
+                log(f"♻️ 重试成功: {msg_id[:8]} → {target_host}")
+            except Exception:
+                pass
+        else:
+            log(f"⏳ 重试仍失败: {msg_id[:8]} → {target_host} ({err[:60]})")
 
 
 def _cleanup_old_messages():
