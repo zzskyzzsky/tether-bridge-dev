@@ -83,15 +83,6 @@ GATEWAY_API_KEY = API_KEY_ENV.strip() if API_KEY_ENV else ""
 
 DINGTALK_WEBHOOK_URL = os.environ.get("DINGTALK_WEBHOOK_URL", "")
 
-FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
-FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
-FEISHU_HOME_CHANNEL = os.environ.get("FEISHU_HOME_CHANNEL", "")
-
-# Feishu API token 缓存
-_feishu_token = ""
-_feishu_token_expires = 0  # unix timestamp
-
-
 _env_path = os.path.expanduser("~/.hermes/.env")
 if os.path.isfile(_env_path):
     try:
@@ -102,26 +93,6 @@ if os.path.isfile(_env_path):
                     GATEWAY_API_KEY = line.split("=", 1)[1].strip()
                 elif line.startswith("DINGTALK_WEBHOOK_URL=") and not DINGTALK_WEBHOOK_URL:
                     DINGTALK_WEBHOOK_URL = line.split("=", 1)[1].strip()
-                elif line.startswith("FEISHU_APP_ID=") and not FEISHU_APP_ID:
-                    FEISHU_APP_ID = line.split("=", 1)[1].strip()
-                elif line.startswith("FEISHU_APP_SECRET=") and not FEISHU_APP_SECRET:
-                    FEISHU_APP_SECRET = line.split("=", 1)[1].strip()
-                elif line.startswith("FEISHU_HOME_CHANNEL=") and not FEISHU_HOME_CHANNEL:
-                    FEISHU_HOME_CHANNEL = line.split("=", 1)[1].strip()
-    except Exception:
-        pass
-
-# 也尝试从 .env 读取飞书 pusher 配置（双重保险）
-# 注意：此时 FEISHU_PUSHER_WEBHOOK_URL 还未定义，直接用 os.environ
-if not os.environ.get("FEISHU_X_PUSHER_WEBHOOK_URL") and os.path.isfile(_env_path):
-    try:
-        with open(_env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("FEISHU_X_PUSHER_WEBHOOK_URL="):
-                    val = line.split("=", 1)[1].strip()
-                    os.environ["FEISHU_X_PUSHER_WEBHOOK_URL"] = val
-                    break
     except Exception:
         pass
 
@@ -141,120 +112,6 @@ _SELF_HEAL_INTERVAL = 15  # 每15秒检查一次 tether 健康
 _DINGTALK_DEDUP_CACHE = {}  # content_hash -> timestamp
 _DINGTALK_DEDUP_SECS = 30
 DINGTALK_LOG_ONLY = False  # 正式通知，真实 POST 到钉钉群
-
-# 飞书 API 唤醒（超时未回复时通过 Feishu API 发群消息唤醒对方）
-FEISHU_WAKEUP_TIMEOUT = int(os.environ.get("FEISHU_WAKEUP_TIMEOUT", "300"))
-# 去重：同一目标同一内容 N 秒内不重复发
-FEISHU_WAKEUP_DEDUP_SECS = 300
-_FEISHU_WAKEUP_DEDUP_CACHE = {}  # (target, content_hash) -> timestamp
-
-
-def _get_feishu_token():
-    """获取并缓存 Feishu tenant_access_token（约1小时有效，提前5分钟刷新）"""
-    global _feishu_token, _feishu_token_expires
-    now = time.time()
-    if _feishu_token and now < _feishu_token_expires - 300:
-        return _feishu_token
-    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
-        return ""
-    try:
-        req = urllib.request.Request(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            data=json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
-        if result.get("code") == 0:
-            _feishu_token = result["tenant_access_token"]
-            _feishu_token_expires = now + result.get("expire", 3600)
-            log(f"✅ Feishu token 已刷新（有效期 {result.get('expire', '?')}s）")
-            return _feishu_token
-        else:
-            log(f"⚠️ Feishu token 获取失败: {result.get('msg', 'unknown')}")
-            return ""
-    except Exception as e:
-        log(f"❌ Feishu token 请求异常: {str(e)[:80]}")
-        return ""
-
-
-def _send_feishu_wakeup(target_nick, local_nick, content, elapsed_seconds=None):
-    """通过 Feishu API（app bot token）发群消息唤醒对方
-
-    使用 app bot 的 tenant_access_token 直接调用 Feishu Open API，
-    消息走 app bot 身份，WebSocket 能收到（替代废弃的 pusher_bot webhook 方案）。
-
-    只有 FEISHU_APP_ID + FEISHU_APP_SECRET 已配置且能获取 token 时才发送。
-    包含去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发送。
-    elapsed_seconds: 实际等待秒数，如果不传则用 FEISHU_WAKEUP_TIMEOUT。
-    """
-    if not FEISHU_APP_ID or not FEISHU_APP_SECRET or not FEISHU_HOME_CHANNEL:
-        log("⚠️ Feishu API 未配置（缺 FEISHU_APP_ID/APP_SECRET/HOME_CHANNEL），跳过 wakeup")
-        return
-    if not content:
-        return
-
-    # 获取 token
-    token = _get_feishu_token()
-    if not token:
-        log("⚠️ 无法获取 Feishu token，跳过 wakeup")
-        return
-
-    # 计算实际等待分钟数
-    if elapsed_seconds is None:
-        elapsed_seconds = FEISHU_WAKEUP_TIMEOUT
-    elapsed_minutes = int(elapsed_seconds / 60)
-
-    # 去重检查
-    content_hash = __import__("hashlib").md5(content.encode()).hexdigest()
-    dedup_key = (target_nick, content_hash)
-    now = time.time()
-    if dedup_key in _FEISHU_WAKEUP_DEDUP_CACHE:
-        if now - _FEISHU_WAKEUP_DEDUP_CACHE[dedup_key] < FEISHU_WAKEUP_DEDUP_SECS:
-            log(f"⏭️ 跳过重复 feishu wakeup（{FEISHU_WAKEUP_DEDUP_SECS}s 内相同目标+内容 {content_hash[:8]}）")
-            return
-    _FEISHU_WAKEUP_DEDUP_CACHE[dedup_key] = now
-    # 定期清理过期缓存
-    if len(_FEISHU_WAKEUP_DEDUP_CACHE) > 50:
-        cutoff = now - FEISHU_WAKEUP_DEDUP_SECS
-        for k in list(_FEISHU_WAKEUP_DEDUP_CACHE.keys()):
-            if _FEISHU_WAKEUP_DEDUP_CACHE[k] < cutoff:
-                del _FEISHU_WAKEUP_DEDUP_CACHE[k]
-
-    wakeup_text = f"[呼叫{target_nick}] 我是{local_nick}，请你尽快去检查你的tether信息，我在 tether 上等待你的回复，已经等待了 {elapsed_minutes} 分钟。"
-    log(f"📢 通过 Feishu API 发送 wakeup 到 {target_nick}: {wakeup_text}")
-
-    try:
-        body = json.dumps({
-            "receive_id": FEISHU_HOME_CHANNEL,
-            "msg_type": "text",
-            "content": json.dumps({"text": wakeup_text}),
-        }).encode()
-        req = urllib.request.Request(
-            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
-        if result.get("code") == 0:
-            msg_id = result.get("data", {}).get("message_id", "?")[:16]
-            log(f"✅ Feishu API wakeup 发送成功（message_id={msg_id}）")
-        else:
-            log(f"⚠️ Feishu API 返回错误: {result.get('msg', 'unknown')}")
-            # token 可能过期，清除缓存触发下次刷新
-            if result.get("code") in (99991663, 99991664):
-                _feishu_token = ""
-    except urllib.error.HTTPError as e:
-        log(f"❌ Feishu API HTTP {e.code}")
-        _feishu_token = ""  # 清除 token 缓存，下次自动刷新
-    except Exception as e:
-        log(f"❌ Feishu API 发送失败: {str(e)[:80]}")
 
 # OOM 自愈计数器：按 msg_id 跟踪连续 OOM
 _OOM_COUNTER = {}  # {msg_id: [count, timestamp]}
@@ -407,81 +264,10 @@ def _tether_restart():
 
 
 def _self_heal():
-    """自愈巡检：Gateway 健康检查 + 自动重启 + feishu wakeup 超时检查"""
+    """自愈巡检：Gateway 健康检查 + 自动重启"""
     _ensure_gateway_alive()
     if not _tether_healthy():
         log("⚠️ Tether 不可达（由 systemd Restart=always 负责恢复）")
-    _check_feishu_wakeup()
-
-
-def _check_feishu_wakeup():
-    """检查 outgoing_messages 和 incoming_messages 中是否有超时未回复的记录，触发 wakeup
-
-    检查逻辑1（出站）：遍历 outgoing_messages 中 acked=0 的记录，
-    如果发送时间超过 FEISHU_WAKEUP_TIMEOUT 秒，说明对方没 ack，
-    通过 Feishu API 发群消息唤醒对方。
-
-    检查逻辑2（入站回复超时）：遍历 incoming messages 中对方发的消息（非auto_reply），
-    如果超过 FEISHU_WAKEUP_TIMEOUT 秒我没有回复（即没有对应的 outgoing_messages 回复），
-    说明对方等太久，通过 Feishu API 发群消息唤醒对方。
-
-    去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发。
-    """
-    if not FEISHU_APP_ID or not FEISHU_APP_SECRET or not FEISHU_HOME_CHANNEL:
-        return
-    try:
-        import sqlite3
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
-        conn = sqlite3.connect(db_path, timeout=3)
-
-        # 检查逻辑1：出站消息超时未 ack
-        rows = conn.execute(
-            "SELECT target_host, sender, message, sent_at FROM outgoing_messages "
-            "WHERE acked=0 AND julianday(sent_at) < julianday('now', ? || ' seconds')",
-            (f"-{FEISHU_WAKEUP_TIMEOUT}",)
-        ).fetchall()
-        if rows:
-            for target_host, sender, message, sent_at in rows:
-                target_nick = _get_peer_nick()
-                # local_nick 使用 _HOST_TO_NICK 映射后的值，避免直接使用主机名
-                local_nick = _get_full_nick(__import__("socket").gethostname()) or __import__("socket").gethostname()
-                # 计算实际等待秒数
-                now_epoch = time.time()
-                sent_epoch = (datetime.fromisoformat(sent_at.replace("Z", "+00:00")) - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()
-                elapsed = int(now_epoch - sent_epoch)
-                _send_feishu_wakeup(target_nick, local_nick, message, elapsed_seconds=elapsed)
-
-        # 检查逻辑2：入站消息超时未回复（双向对话超时检测）
-        local_hostname = __import__("socket").gethostname()
-        local_nick = _get_full_nick(local_hostname) or local_hostname
-        # 查询超时的入站消息，过滤掉自己hostname发来的消息
-        rows2 = conn.execute(
-            "SELECT id, sender, message, received_at FROM messages "
-            "WHERE acked=1 AND type != 'handoff' AND type != 'auto_reply' "
-            "AND julianday(received_at) < julianday('now', ? || ' seconds') "
-            "AND sender NOT LIKE ? "
-            "ORDER BY received_at ASC LIMIT 10",
-            (f"-{FEISHU_WAKEUP_TIMEOUT}", f"%{local_hostname}%")
-        ).fetchall()
-        if rows2:
-            for msg_id, sender, message, received_at in rows2:
-                # 确定对方主机
-                sender_host = sender.split()[0] if " " in sender else sender.split("@")[-1]
-                target_nick = _get_nick(sender_host)
-                # 检查是否已有 outgoing_messages 回复过（收到对方消息之后发的）
-                reply_exists = conn.execute(
-                    "SELECT COUNT(*) FROM outgoing_messages "
-                    "WHERE julianday(sent_at) >= julianday(?)",
-                    (received_at,)
-                ).fetchone()[0] > 0
-                if not reply_exists:
-                    # 计算实际等待秒数（从对方发消息到现在）
-                    received_epoch = (datetime.fromisoformat(received_at.replace("Z", "+00:00")) - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()
-                    elapsed = int(time.time() - received_epoch)
-                    _send_feishu_wakeup(target_nick, local_nick, f"等待回复超时: {message[:100]}", elapsed_seconds=elapsed)
-        conn.close()
-    except Exception as e:
-        log(f"feishu wakeup 检查异常: {str(e)[:80]}")
 
 
 def _tether_get(path):
