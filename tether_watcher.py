@@ -32,12 +32,14 @@ TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 _HOST_TO_NICK_SHORT = {
     "zzsky-mbp": "mac",
     "zzskytpg3": "tp",
+    "154.8.143.218": "tp",   # VPS relay -> tp
 }
 
 # host -> 全名映射（local_nick：tp-哥哥/mac-弟弟）
 _HOST_TO_NICK_FULL = {
     "zzsky-mbp": "mac-弟弟",
     "zzskytpg3": "tp-哥哥",
+    "154.8.143.218": "tp-哥哥",  # VPS relay -> tp-哥哥
 }
 
 
@@ -81,6 +83,15 @@ GATEWAY_API_KEY = API_KEY_ENV.strip() if API_KEY_ENV else ""
 
 DINGTALK_WEBHOOK_URL = os.environ.get("DINGTALK_WEBHOOK_URL", "")
 
+FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+FEISHU_HOME_CHANNEL = os.environ.get("FEISHU_HOME_CHANNEL", "")
+
+# Feishu API token 缓存
+_feishu_token = ""
+_feishu_token_expires = 0  # unix timestamp
+
+
 _env_path = os.path.expanduser("~/.hermes/.env")
 if os.path.isfile(_env_path):
     try:
@@ -91,6 +102,12 @@ if os.path.isfile(_env_path):
                     GATEWAY_API_KEY = line.split("=", 1)[1].strip()
                 elif line.startswith("DINGTALK_WEBHOOK_URL=") and not DINGTALK_WEBHOOK_URL:
                     DINGTALK_WEBHOOK_URL = line.split("=", 1)[1].strip()
+                elif line.startswith("FEISHU_APP_ID=") and not FEISHU_APP_ID:
+                    FEISHU_APP_ID = line.split("=", 1)[1].strip()
+                elif line.startswith("FEISHU_APP_SECRET=") and not FEISHU_APP_SECRET:
+                    FEISHU_APP_SECRET = line.split("=", 1)[1].strip()
+                elif line.startswith("FEISHU_HOME_CHANNEL=") and not FEISHU_HOME_CHANNEL:
+                    FEISHU_HOME_CHANNEL = line.split("=", 1)[1].strip()
     except Exception:
         pass
 
@@ -125,26 +142,63 @@ _DINGTALK_DEDUP_CACHE = {}  # content_hash -> timestamp
 _DINGTALK_DEDUP_SECS = 30
 DINGTALK_LOG_ONLY = False  # 正式通知，真实 POST 到钉钉群
 
-# 飞书 pusher 唤醒（超时未回复时发群消息唤醒对方）
-FEISHU_PUSHER_OPEN_ID = os.environ.get("FEISHU_X_PUSHER_ID", "")
-FEISHU_PUSHER_WEBHOOK_URL = os.environ.get("FEISHU_X_PUSHER_WEBHOOK_URL", "")
-# 超时秒数：发出 auto_reply 后 N 秒未收到对方回复，触发 webhook 唤醒
+# 飞书 API 唤醒（超时未回复时通过 Feishu API 发群消息唤醒对方）
 FEISHU_WAKEUP_TIMEOUT = int(os.environ.get("FEISHU_WAKEUP_TIMEOUT", "300"))
-# 去重：同一目标同一内容 N 秒内不重复发 webhook
+# 去重：同一目标同一内容 N 秒内不重复发
 FEISHU_WAKEUP_DEDUP_SECS = 300
 _FEISHU_WAKEUP_DEDUP_CACHE = {}  # (target, content_hash) -> timestamp
 
 
-def _send_feishu_wakeup(target_nick, local_nick, content, elapsed_seconds=None):
-    """通过 pusher_bot webhook 发群消息唤醒对方
+def _get_feishu_token():
+    """获取并缓存 Feishu tenant_access_token（约1小时有效，提前5分钟刷新）"""
+    global _feishu_token, _feishu_token_expires
+    now = time.time()
+    if _feishu_token and now < _feishu_token_expires - 300:
+        return _feishu_token
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+        return ""
+    try:
+        req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        if result.get("code") == 0:
+            _feishu_token = result["tenant_access_token"]
+            _feishu_token_expires = now + result.get("expire", 3600)
+            log(f"✅ Feishu token 已刷新（有效期 {result.get('expire', '?')}s）")
+            return _feishu_token
+        else:
+            log(f"⚠️ Feishu token 获取失败: {result.get('msg', 'unknown')}")
+            return ""
+    except Exception as e:
+        log(f"❌ Feishu token 请求异常: {str(e)[:80]}")
+        return ""
 
-    只有 FEISHU_PUSHER_WEBHOOK_URL 已配置时才发送。
+
+def _send_feishu_wakeup(target_nick, local_nick, content, elapsed_seconds=None):
+    """通过 Feishu API（app bot token）发群消息唤醒对方
+
+    使用 app bot 的 tenant_access_token 直接调用 Feishu Open API，
+    消息走 app bot 身份，WebSocket 能收到（替代废弃的 pusher_bot webhook 方案）。
+
+    只有 FEISHU_APP_ID + FEISHU_APP_SECRET 已配置且能获取 token 时才发送。
     包含去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发送。
-    elapsed_seconds: 实际等待秒数（从 sent_at/received_at 到现在的秒数），如果不传则用 FEISHU_WAKEUP_TIMEOUT。
+    elapsed_seconds: 实际等待秒数，如果不传则用 FEISHU_WAKEUP_TIMEOUT。
     """
-    if not FEISHU_PUSHER_WEBHOOK_URL:
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET or not FEISHU_HOME_CHANNEL:
+        log("⚠️ Feishu API 未配置（缺 FEISHU_APP_ID/APP_SECRET/HOME_CHANNEL），跳过 wakeup")
         return
     if not content:
+        return
+
+    # 获取 token
+    token = _get_feishu_token()
+    if not token:
+        log("⚠️ 无法获取 Feishu token，跳过 wakeup")
         return
 
     # 计算实际等待分钟数
@@ -169,26 +223,38 @@ def _send_feishu_wakeup(target_nick, local_nick, content, elapsed_seconds=None):
                 del _FEISHU_WAKEUP_DEDUP_CACHE[k]
 
     wakeup_text = f"[呼叫{target_nick}] 我是{local_nick}，请你尽快去检查你的tether信息，我在 tether 上等待你的回复，已经等待了 {elapsed_minutes} 分钟。"
-    log(f"📢 通过 pusher_bot 发送 wakeup 到 {target_nick}: {wakeup_text}")
+    log(f"📢 通过 Feishu API 发送 wakeup 到 {target_nick}: {wakeup_text}")
 
     try:
+        body = json.dumps({
+            "receive_id": FEISHU_HOME_CHANNEL,
+            "msg_type": "text",
+            "content": json.dumps({"text": wakeup_text}),
+        }).encode()
         req = urllib.request.Request(
-            FEISHU_PUSHER_WEBHOOK_URL,
-            data=json.dumps({
-                "msg_type": "text",
-                "content": {"text": wakeup_text},
-            }).encode(),
-            headers={"Content-Type": "application/json"},
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read())
         if result.get("code") == 0:
-            log(f"✅ pusher_bot webhook 发送成功")
+            msg_id = result.get("data", {}).get("message_id", "?")[:16]
+            log(f"✅ Feishu API wakeup 发送成功（message_id={msg_id}）")
         else:
-            log(f"⚠️ pusher_bot 返回错误: {result.get('msg', 'unknown')}")
+            log(f"⚠️ Feishu API 返回错误: {result.get('msg', 'unknown')}")
+            # token 可能过期，清除缓存触发下次刷新
+            if result.get("code") in (99991663, 99991664):
+                _feishu_token = ""
+    except urllib.error.HTTPError as e:
+        log(f"❌ Feishu API HTTP {e.code}")
+        _feishu_token = ""  # 清除 token 缓存，下次自动刷新
     except Exception as e:
-        log(f"❌ pusher_bot POST 失败: {str(e)[:80]}")
+        log(f"❌ Feishu API 发送失败: {str(e)[:80]}")
 
 # OOM 自愈计数器：按 msg_id 跟踪连续 OOM
 _OOM_COUNTER = {}  # {msg_id: [count, timestamp]}
@@ -353,15 +419,15 @@ def _check_feishu_wakeup():
 
     检查逻辑1（出站）：遍历 outgoing_messages 中 acked=0 的记录，
     如果发送时间超过 FEISHU_WAKEUP_TIMEOUT 秒，说明对方没 ack，
-    通过 pusher_bot webhook 发送唤醒消息到群里。
+    通过 Feishu API 发群消息唤醒对方。
 
     检查逻辑2（入站回复超时）：遍历 incoming messages 中对方发的消息（非auto_reply），
     如果超过 FEISHU_WAKEUP_TIMEOUT 秒我没有回复（即没有对应的 outgoing_messages 回复），
-    说明对方等太久，通过 pusher_bot webhook 发送唤醒消息到群里。
+    说明对方等太久，通过 Feishu API 发群消息唤醒对方。
 
     去重：同一目标同一内容在 FEISHU_WAKEUP_DEDUP_SECS 内不重复发。
     """
-    if not FEISHU_PUSHER_WEBHOOK_URL:
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET or not FEISHU_HOME_CHANNEL:
         return
     try:
         import sqlite3
