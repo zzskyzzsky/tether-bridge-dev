@@ -883,6 +883,7 @@ def _check_handoff_timeout():
             return
 
         conn = sqlite3.connect(db_path, timeout=3)
+        # 检查1：出站消息未送达（acked=0）超时
         rows = conn.execute(
             "SELECT id, target_host, message FROM outgoing_messages "
             "WHERE acked=0 "
@@ -890,16 +891,57 @@ def _check_handoff_timeout():
             "ORDER BY sent_at ASC LIMIT 3",
             (str(_HANDOFF_TIMEOUT_MINUTES),)
         ).fetchall()
+
+        # 检查2：入站消息超时——对端发了但5分钟没新消息
+        recent = conn.execute(
+            "SELECT MAX(received_at) FROM messages WHERE type='info'"
+        ).fetchone()[0]
+        peer_silent = False
+        if recent:
+            recent_ts = recent.replace('T', ' ')[:19]
+            row2 = conn.execute(
+                "SELECT 1 WHERE ? < datetime('now', '-' || ? || ' minutes')",
+                (recent_ts, str(_HANDOFF_TIMEOUT_MINUTES))
+            ).fetchone()
+            peer_silent = bool(row2)
         conn.close()
     except Exception:
         return
 
-    if not rows:
+    if not rows and not peer_silent:
         return
 
     now = time.time()
     hostname = __import__("socket").gethostname()
     sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
+
+    if peer_silent and not rows:
+        # 入站超时：对端5分钟没发新消息
+        log(f"📞 对端静默超时（{_HANDOFF_TIMEOUT_MINUTES}分钟无新消息），发送唤醒")
+        timeout_msg = f"[呼叫] {_HANDOFF_TIMEOUT_MINUTES}分钟没收到对端新消息"
+        log(f"📞 超时静默: {timeout_msg}")
+        peer_host = os.environ.get("TETHER_PEER_HOST", "")
+        if not peer_host:
+            return
+        payload = json.dumps({
+            "from": f"{hostname} ({sender_nick})",
+            "sender": f"{hostname} ({sender_nick})",
+            "message": timeout_msg,
+            "content": timeout_msg,
+            "type": "info",
+        }).encode()
+        candidates = [peer_host]
+        sent = False
+        for host in candidates:
+            url = f"http://{host}:{PEER_PORT}/message"
+            ok, err = _try_post(url, payload)
+            if ok:
+                log(f"📞 静默唤醒已发送到 {host}")
+                sent = True
+                break
+        notify_text = f"⏰ 对端静默超时\n\n{_HANDOFF_TIMEOUT_MINUTES}分钟未收到对端消息，已发送唤醒。\n目标: {peer_host}"
+        _send_notification(notify_text)
+        return
 
     for msg_id, target_host, msg_text in rows:
         # 去重：同一消息在 COOLDOWN 内不重复唤醒
