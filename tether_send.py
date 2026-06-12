@@ -50,6 +50,8 @@ def print_usage():
     print("  --port, -p <端口>   目标端口（默认 9001）", file=sys.stderr)
     print("  --type, -t <类型>   消息类型: info（默认）| handoff", file=sys.stderr)
     print("  --nick <昵称>       发送方昵称（覆盖环境变量 TETHER_SENDER_NICK）", file=sys.stderr)
+    print("  --peer <主机>       目标主机（--host 的别名，与 relay 脚本一致）", file=sys.stderr)
+    print("  --identity <昵称>   发送方昵称（--nick 的别名）", file=sys.stderr)
     print("", file=sys.stderr)
     print("环境变量:", file=sys.stderr)
     print(f"  {ENV_HOST_KEY}     默认目标主机", file=sys.stderr)
@@ -100,6 +102,20 @@ def parse_args():
             i += 1
             if i >= len(args):
                 print("❌ --nick 缺少参数值", file=sys.stderr)
+                sys.exit(1)
+            nick = args[i]
+        elif args[i] == "--peer":
+            # --peer 是 --host 别名（relay 脚本使用）
+            i += 1
+            if i >= len(args):
+                print("❌ --peer 缺少参数值", file=sys.stderr)
+                sys.exit(1)
+            host = args[i]
+        elif args[i] == "--identity":
+            # --identity 是 --nick 别名
+            i += 1
+            if i >= len(args):
+                print("❌ --identity 缺少参数值", file=sys.stderr)
                 sys.exit(1)
             nick = args[i]
         else:
