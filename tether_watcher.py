@@ -767,7 +767,7 @@ def _check_outgoing_retry():
         conn = sqlite3.connect(db_path, timeout=3)
         rows = conn.execute(
             "SELECT id, target_host, message, sender FROM outgoing_messages "
-            "WHERE acked=0 AND sent_at < datetime('now', '-30 seconds', 'utc') "
+            "WHERE acked=0 AND sent_at < datetime('now', '-30 seconds') "
             "ORDER BY sent_at ASC LIMIT 5"
         ).fetchall()
         conn.close()
