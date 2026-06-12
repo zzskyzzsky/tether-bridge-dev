@@ -125,6 +125,10 @@ _HANDOFF_TIMEOUT_CACHE = {}  # outgoing_msg_id -> timestamp
 _HANDOFF_TIMEOUT_MINUTES = 5  # 默认5分钟
 _HANDOFF_TIMEOUT_COOLDOWN = 120  # 同一消息不重复唤醒（秒）
 
+# 对端静默检测去重缓存
+_PEER_SILENCE_CACHE_KEY = "last_wakeup"  # 通用 key，不分消息
+_PEER_SILENCE_COOLDOWN = 120  # 2分钟内不重复发静默唤醒
+
 # OOM 自愈计数器：按 msg_id 跟踪连续 OOM
 _OOM_COUNTER = {}  # {msg_id: [count, timestamp]}
 _OOM_WINDOW = 300  # 5分钟窗口，超时重置
@@ -280,6 +284,7 @@ def _self_heal():
     _ensure_gateway_alive()
     _check_outgoing_retry()
     _check_handoff_timeout()  # 检查超时无回复的消息，生成唤醒
+    _check_peer_silence()     # 检查对端是否长时间无任何消息
     if not _tether_healthy():
         log("⚠️ Tether 不可达（由 systemd Restart=always 负责恢复）")
 
@@ -999,6 +1004,105 @@ def _check_handoff_timeout():
             f"已发送唤醒 handoff: {'是' if sent else '否（发送失败）'}"
         )
         _send_notification(notify_text)
+
+
+def _check_peer_silence():
+    """检查对端是否长时间无任何消息（不管 acked 状态）
+
+    覆盖 acked=1 但对方 watcher 没处理/没回复的场景。
+    查询 messages 表中最近一条来自对端的消息，如果超过 TIMEOUT_MINUTES 则触发通用唤醒。
+    用 _PEER_SILENCE_CACHE_KEY 做单 key 去重，COOLDOWN 内不重复发。
+    """
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        if not os.path.isfile(db_path):
+            return
+
+        hostname = __import__("socket").gethostname()
+        conn = sqlite3.connect(db_path, timeout=3)
+        row = conn.execute(
+            "SELECT received_at FROM messages "
+            "WHERE sender NOT LIKE ? "
+            "AND sender NOT LIKE '127.0.0.1%' "
+            "ORDER BY received_at DESC LIMIT 1",
+            (f'%{hostname}%',)
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return
+
+    if not row:
+        return  # 没有历史消息，不触发
+
+    try:
+        last_time_str = row[0]  # ISO format: '2026-06-12T12:50:57.730821+00:00'
+        # 与当前时间比较
+        import sqlite3 as _sq
+        _tmp = _sq.connect(":memory:")
+        is_timeout = _tmp.execute(
+            "SELECT REPLACE(SUBSTR(?, 1, 19), 'T', ' ') < datetime('now', '-' || ? || ' minutes')",
+            (last_time_str, str(_HANDOFF_TIMEOUT_MINUTES))
+        ).fetchone()[0]
+        _tmp.close()
+    except Exception:
+        return
+
+    if not is_timeout:
+        return  # 对端最近还有消息，不用唤醒
+
+    # 去重：COOLDOWN 内不重复发
+    now = time.time()
+    if _PEER_SILENCE_CACHE_KEY in _HANDOFF_TIMEOUT_CACHE:
+        if now - _HANDOFF_TIMEOUT_CACHE[_PEER_SILENCE_CACHE_KEY] < _PEER_SILENCE_COOLDOWN:
+            return
+    _HANDOFF_TIMEOUT_CACHE[_PEER_SILENCE_CACHE_KEY] = now
+
+    log(f"📞 对端静默超时（>{_HANDOFF_TIMEOUT_MINUTES}分钟无消息）")
+
+    # 发送通用唤醒 handoff
+    hostname = __import__("socket").gethostname()
+    sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
+    peer_host = os.environ.get("TETHER_PEER_HOST", "")
+    wakeup_msg = (
+        f"[呼叫] 已经{_HANDOFF_TIMEOUT_MINUTES}分钟没收到你的消息了，"
+        f"请检查你的 Tether watcher 是否正常工作。"
+    )
+
+    payload = json.dumps({
+        "from": f"{hostname} ({sender_nick})",
+        "sender": f"{hostname} ({sender_nick})",
+        "message": wakeup_msg,
+        "content": wakeup_msg,
+        "type": "info",
+        "ttl": 2,
+    }).encode()
+
+    sent = False
+    candidates = [peer_host] if peer_host else []
+    if PEER_FALLBACK_HOST and PEER_FALLBACK_HOST != peer_host:
+        candidates.append(PEER_FALLBACK_HOST)
+
+    for host in candidates:
+        if not host:
+            continue
+        url = f"http://{host}:{PEER_PORT}/message"
+        ok, err = _try_post(url, payload)
+        if ok:
+            log(f"📞 静默唤醒已发送到 {host}")
+            sent = True
+            break
+        else:
+            log(f"⏳ 静默唤醒发送到 {host} 失败: {err}")
+
+    # 通知主人
+    notify_text = (
+        f"⏰ Tether 对端静默超时\n\n"
+        f"超过 {_HANDOFF_TIMEOUT_MINUTES} 分钟未收到来自对端的任何消息。\n"
+        f"最后一条消息时间：{last_time_str[:19]}\n"
+        f"已发送唤醒 handoff: {'是' if sent else '否（发送失败）'}"
+    )
+    _send_notification(notify_text)
 
 
 def _cleanup_old_messages():
