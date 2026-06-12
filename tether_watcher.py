@@ -1095,14 +1095,12 @@ def _check_peer_silence():
         else:
             log(f"⏳ 静默唤醒发送到 {host} 失败: {err}")
 
-    # 通知主人
-    notify_text = (
-        f"⏰ Tether 对端静默超时\n\n"
-        f"超过 {_HANDOFF_TIMEOUT_MINUTES} 分钟未收到来自对端的任何消息。\n"
-        f"最后一条消息时间：{last_time_str[:19]}\n"
-        f"已发送唤醒 handoff: {'是' if sent else '否（发送失败）'}"
+    # 静默超时只写日志，不通知主人（任意静默不是错误，没有活跃任务时安静是正常的）
+    log(
+        f"📝 对端静默超时: >{_HANDOFF_TIMEOUT_MINUTES}分钟无消息, "
+        f"最后消息时间={last_time_str[:19]}, "
+        f"唤醒={'成功' if sent else '失败'}"
     )
-    _send_notification(notify_text)
 
 
 def _cleanup_old_messages():
