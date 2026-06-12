@@ -551,7 +551,7 @@ def _auto_reply(output, sender_info, original_msg_id=None):
                 conn.execute(
                     "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
                     (str(uuid.uuid4()), candidate, f"{hostname} ({sender_nick})", reply_text,
-                     datetime.now(timezone.utc).isoformat())
+                     datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
                 )
                 conn.commit()
                 conn.close()
@@ -570,7 +570,7 @@ def _auto_reply(output, sender_info, original_msg_id=None):
         conn.execute(
             "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,0)",
             (str(uuid.uuid4()), target_host, f"{hostname} ({sender_nick})", reply_text,
-             datetime.now(timezone.utc).isoformat())
+             datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
         )
         conn.commit()
         conn.close()
