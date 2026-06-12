@@ -789,9 +789,6 @@ def process_messages():
         return 0
     _processing = True
     try:
-        # 不在此处做自愈——自愈由 _self_heal() 每15s处理
-        # 如果 Gateway 挂了，_gateway_chat() 会回退到 hermes -z 子进程
-
         data, err = _tether_get("/messages?ack=1")
         if err or not data:
             log(f"取消息失败: {err}")
@@ -841,44 +838,17 @@ def process_messages():
                 f"请理解内容并直接处理或回复。处理完成后给出总结。"
             )
 
-            processed = False
             output = None
 
-            # 快速探测 Gateway 存活（短超时 3s），死透则跳过 Gateway 直走子进程
-            # 避免 Gateway 挂了时每个消息等 300 秒超时才回退
             if _is_gateway_alive():
                 output, err = _gateway_chat(prompt, timeout=300)
                 if err is None and output is not None:
                     has_out = bool(output)
                     log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
-                    processed = True
                 else:
-                    log(f"Gateway 失败 ({err or 'no output'}), 回退子进程")
+                    log(f"❌ Gateway 处理失败 ({err or 'no output'}), 消息跳过")
             else:
-                log(f"Gateway 不在线，直走子进程")
-
-            # Gateway 失败则走子进程
-            if not processed:
-                cmd = _get_hermes_args(prompt)
-                if cmd:
-                    try:
-                        r = subprocess.run(
-                            cmd,
-                            capture_output=True, text=True, timeout=300,
-                            preexec_fn=_limit_memory
-                        )
-                        if _detect_oom(r.returncode, msg.get("id", "")):
-                            # OOM 事件已记录，output 保持 None
-                            pass
-                        elif r.returncode == 0 and r.stdout.strip():
-                            output = r.stdout.strip()
-                            log(f"✅ {mid} 处理完成 (子进程, {len(output)} chars)")
-                        else:
-                            log(f"⚠️ {mid} 子进程 rc={r.returncode}")
-                    except subprocess.TimeoutExpired:
-                        log(f"⏰ {mid} 超时 (300s)")
-                else:
-                    log("\u274c 找不到 hermes CLI")
+                log(f"❌ Gateway 不在线，消息跳过")
 
             # 汇报或自动回复：Report 发 DingTalk，其他回发送方
             if output and sender:
