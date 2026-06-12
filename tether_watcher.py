@@ -82,6 +82,7 @@ API_KEY_ENV = os.environ.get("API_SERVER_KEY", "")
 GATEWAY_API_KEY = API_KEY_ENV.strip() if API_KEY_ENV else ""
 
 DINGTALK_WEBHOOK_URL = os.environ.get("DINGTALK_WEBHOOK_URL", "")
+NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "")
 
 _env_path = os.path.expanduser("~/.hermes/.env")
 if os.path.isfile(_env_path):
@@ -93,6 +94,8 @@ if os.path.isfile(_env_path):
                     GATEWAY_API_KEY = line.split("=", 1)[1].strip()
                 elif line.startswith("DINGTALK_WEBHOOK_URL=") and not DINGTALK_WEBHOOK_URL:
                     DINGTALK_WEBHOOK_URL = line.split("=", 1)[1].strip()
+                elif line.startswith("NOTIFY_WEBHOOK_URL=") and not NOTIFY_WEBHOOK_URL:
+                    NOTIFY_WEBHOOK_URL = line.split("=", 1)[1].strip()
     except Exception:
         pass
 
@@ -112,6 +115,15 @@ _SELF_HEAL_INTERVAL = 15  # 每15秒检查一次 tether 健康
 _DINGTALK_DEDUP_CACHE = {}  # content_hash -> timestamp
 _DINGTALK_DEDUP_SECS = 30
 DINGTALK_LOG_ONLY = False  # 正式通知，真实 POST 到钉钉群
+
+# 飞书/通用 Webhook 通知：NOTIFY_WEBHOOK_URL 优先，兼容 DINGTALK
+if not NOTIFY_WEBHOOK_URL and DINGTALK_WEBHOOK_URL:
+    NOTIFY_WEBHOOK_URL = DINGTALK_WEBHOOK_URL
+
+# 超时唤醒去重缓存
+_HANDOFF_TIMEOUT_CACHE = {}  # outgoing_msg_id -> timestamp
+_HANDOFF_TIMEOUT_MINUTES = 5  # 默认5分钟
+_HANDOFF_TIMEOUT_COOLDOWN = 120  # 同一消息不重复唤醒（秒）
 
 # OOM 自愈计数器：按 msg_id 跟踪连续 OOM
 _OOM_COUNTER = {}  # {msg_id: [count, timestamp]}
@@ -264,9 +276,10 @@ def _tether_restart():
 
 
 def _self_heal():
-    """自愈巡检：Gateway 健康检查 + outgoing 重试 + 自动重启"""
+    """自愈巡检：Gateway 健康检查 + outgoing 重试 + 超时唤醒 + 自动重启"""
     _ensure_gateway_alive()
     _check_outgoing_retry()
+    _check_handoff_timeout()  # 检查超时无回复的消息，生成唤醒
     if not _tether_healthy():
         log("⚠️ Tether 不可达（由 systemd Restart=always 负责恢复）")
 
@@ -429,6 +442,60 @@ def _send_dingtalk(content):
             log(f"⚠️ DingTalk 返回错误: {result.get('errmsg', 'unknown')}")
     except Exception as e:
         log(f"❌ DingTalk POST 失败: {str(e)[:60]}")
+    _write_report_to_file(content)
+
+
+def _send_notification(content):
+    """通过 Webhook 发送通知（支持飞书 + 钉钉）
+
+    根据 NOTIFY_WEBHOOK_URL 自动判断格式：
+    - 飞书群机器人: msg_type=text
+    - 钉钉群机器人: msgtype=text
+    - 都不匹配则仅写入日志
+    """
+    if not content:
+        return
+    if not NOTIFY_WEBHOOK_URL:
+        log("⚠️ NOTIFY_WEBHOOK_URL 未配置，跳过通知")
+        _write_report_to_file(content)
+        return
+
+    # 判断 webhook 类型
+    is_feishu = "feishu.cn" in NOTIFY_WEBHOOK_URL.lower() or "larksuite" in NOTIFY_WEBHOOK_URL.lower()
+    is_dingtalk = "dingtalk" in NOTIFY_WEBHOOK_URL.lower()
+
+    if is_feishu:
+        payload = {
+            "msg_type": "text",
+            "content": {"text": f"🤖 Tether 报告\n\n{content[:3000]}"},
+        }
+    elif is_dingtalk:
+        payload = {
+            "msgtype": "text",
+            "text": {"content": f"🤖 Tether 报告\n\n{content[:3000]}"},
+        }
+    else:
+        # 无法识别类型，尝试飞书格式
+        payload = {
+            "msg_type": "text",
+            "content": {"text": f"🤖 Tether 报告\n\n{content[:3000]}"},
+        }
+
+    try:
+        req = urllib.request.Request(
+            NOTIFY_WEBHOOK_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        if result.get("StatusCode") == 0 or result.get("errcode") == 0:
+            log("✅ 通知发送成功")
+        else:
+            log(f"⚠️ 通知返回错误: {str(result)[:80]}")
+    except Exception as e:
+        log(f"❌ 通知 POST 失败: {str(e)[:60]}")
     _write_report_to_file(content)
 
 
@@ -798,6 +865,98 @@ def _check_outgoing_retry():
                 pass
         else:
             log(f"⏳ 重试仍失败: {msg_id[:8]} → {target_host} ({err[:60]})")
+
+
+def _check_handoff_timeout():
+    """检查 outgoing 消息超时无回复，生成唤醒 handoff 并通知主人
+
+    在 _self_heal() 中每15秒调用一次。
+    - 查 outgoing 中 acked=0 且超过 TIMEOUT_MINUTES 的消息
+    - 对每条超时消息，生成 [呼叫] 唤醒 handoff 重新发到对端
+    - 同时发送通知到飞书/钉钉
+    - 同一条消息 COOLDOWN 内不重复唤醒（防刷屏）
+    """
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        if not os.path.isfile(db_path):
+            return
+
+        conn = sqlite3.connect(db_path, timeout=3)
+        rows = conn.execute(
+            "SELECT id, target_host, message FROM outgoing_messages "
+            "WHERE acked=0 "
+            "AND REPLACE(SUBSTR(sent_at, 1, 19), 'T', ' ') < datetime('now', '-' || ? || ' minutes') "
+            "ORDER BY sent_at ASC LIMIT 3",
+            (str(_HANDOFF_TIMEOUT_MINUTES),)
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return
+
+    if not rows:
+        return
+
+    now = time.time()
+    hostname = __import__("socket").gethostname()
+    sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
+
+    for msg_id, target_host, msg_text in rows:
+        # 去重：同一消息在 COOLDOWN 内不重复唤醒
+        if msg_id in _HANDOFF_TIMEOUT_CACHE:
+            if now - _HANDOFF_TIMEOUT_CACHE[msg_id] < _HANDOFF_TIMEOUT_COOLDOWN:
+                continue
+        _HANDOFF_TIMEOUT_CACHE[msg_id] = now
+
+        # 清理过期缓存
+        if len(_HANDOFF_TIMEOUT_CACHE) > 100:
+            cutoff = now - _HANDOFF_TIMEOUT_COOLDOWN
+            for k, v in list(_HANDOFF_TIMEOUT_CACHE.items()):
+                if v < cutoff:
+                    del _HANDOFF_TIMEOUT_CACHE[k]
+
+        summary = (msg_text or "")[:100]
+        timeout_msg = (
+            f"[呼叫] 等了{_HANDOFF_TIMEOUT_MINUTES}分钟没人回：{summary}"
+        )
+        log(f"📞 超时唤醒 #{msg_id[:8]} → {target_host}: {summary[:60]}")
+
+        # 1. 发送唤醒 handoff 到对端 Tether
+        payload = json.dumps({
+            "from": f"{hostname} ({sender_nick})",
+            "sender": f"{hostname} ({sender_nick})",
+            "message": timeout_msg,
+            "content": timeout_msg,
+            "type": "info",
+            "ttl": 2,
+        }).encode()
+
+        peer_url = f"http://{target_host}:{PEER_PORT}/message"
+        # 如果有 fallback，也加到候选地址中
+        candidates = [target_host]
+        if PEER_FALLBACK_HOST and PEER_FALLBACK_HOST != target_host:
+            candidates.append(PEER_FALLBACK_HOST)
+
+        sent = False
+        for host in candidates:
+            url = f"http://{host}:{PEER_PORT}/message"
+            ok, err = _try_post(url, payload)
+            if ok:
+                log(f"📞 唤醒 handoff 已发送到 {host}")
+                sent = True
+                break
+            else:
+                log(f"⏳ 唤醒发送到 {host} 失败: {err}")
+
+        # 2. 通知主人
+        notify_text = (
+            f"⏰ Tether 超时唤醒\n\n"
+            f"消息 #{msg_id[:8]} 已发出 {_HANDOFF_TIMEOUT_MINUTES} 分钟未送达对端。\n"
+            f"目标: {target_host}\n"
+            f"摘要: {summary}\n"
+            f"已发送唤醒 handoff: {'是' if sent else '否（发送失败）'}"
+        )
+        _send_notification(notify_text)
 
 
 def _cleanup_old_messages():
