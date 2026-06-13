@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Tether Alive — 对话活性监控 + 保活唤醒
+Tether Alive — 对话活性监控 + 保活唤醒（v2）
 
 独立于 tether_watcher.py 运行的外部守护进程。
 检测 Tether 协作对话是否卡住（消息成功送达但双方停止推进），
 通过发送唤醒消息打破僵局。
+
+v2 改进：
+  - 自动扫描 DB 中 {(新任务)}...{(完)} 格式，保存任务上下文
+  - 唤醒时注入任务原文，让 agent 真正继续未完成的工作
+  - 缩短检测间隔（5 分钟超时），尽早发现卡住
 
 核心差异 vs tether watcher 内置的超时检测:
   内置 _check_handoff_timeout() 只查 outgoing WHERE acked=0（投递失败）
@@ -19,15 +24,11 @@ Tether Alive — 对话活性监控 + 保活唤醒
   python3 tether_alive.py                          # 单次检查
   python3 tether_alive.py --watch                  # 持续监控(默认间隔120s)
   python3 tether_alive.py --watch --interval 60    # 每60秒检查一次
-
-安装为 systemd (可选):
-  cp tether-alive.service ~/.config/systemd/user/
-  systemctl --user daemon-reload
-  systemctl --user enable --now tether-alive.service
 """
 
 import json
 import os
+import re as _re
 import sqlite3
 import socket
 import sys
@@ -41,15 +42,27 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 STATE_FILE = "/tmp/tether_alive_state.json"
 
 DEFAULT_POLL_INTERVAL = 120        # 检查间隔（秒）
-STALL_TIMEOUT_MINUTES = 25         # 对端多久无消息视为"可能卡住"
-COOLDOWN_MINUTES = 20              # 同一方向不重复唤醒
-ACTIVITY_WINDOW_MINUTES = 40       # 在此窗口内有对话记录才算"活跃过"
+STALL_TIMEOUT_MINUTES = 5          # 对端多久无消息视为"可能卡住"（v2 缩短到5分钟）
+COOLDOWN_MINUTES = 10              # 同一方向不重复唤醒
+ACTIVITY_WINDOW_MINUTES = 20       # 在此窗口内有对话记录才算"活跃过"
 
 PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
 LOCAL_HOSTNAME = socket.gethostname()
 
 # 唤醒时包含的最近消息条数
 CONTEXT_MESSAGE_COUNT = 3
+
+# {(新任务)}...{(完)} 格式的正则
+TASK_MARKER_PATTERN = _re.compile(
+    r'\{\('
+    r'新任务'
+    r'\)\}'
+    r'(.*?)'
+    r'\{\('
+    r'完'
+    r'\)\}',
+    _re.DOTALL
+)
 
 
 def log(msg):
@@ -69,11 +82,12 @@ def _get_sender_nick():
 def _load_state():
     """加载持久化状态"""
     default = {
-        "last_peer_msg_time": None,      # 上次看到对端消息的时间
-        "last_wakeup_time": 0.0,         # 上次发送唤醒的时间戳(epoch)
-        "last_wakeup_target": "",        # 上次唤醒的目标
-        "conversation_was_active": False, # 之前是否活跃（用于检测"从活跃变静默"）
-        "consecutive_stalls": 0,         # 连续检测到卡住的次数（含去重）
+        "last_peer_msg_time": None,
+        "last_wakeup_time": 0.0,
+        "last_wakeup_target": "",
+        "conversation_was_active": False,
+        "consecutive_stalls": 0,
+        "current_task": "",          # v2: 上次检测到的 {(新任务)}...{(完)} 内容
     }
     if not os.path.isfile(STATE_FILE):
         return default
@@ -108,8 +122,27 @@ def _get_db():
         return None
 
 
+def _scan_new_task(conn):
+    """扫描 messages 表，查找 {(新任务)}...{(完)} 格式，返回任务文本或空字符串"""
+    try:
+        rows = conn.execute(
+            "SELECT message FROM messages "
+            "WHERE message LIKE '%{(新任务)}%' "
+            "ORDER BY received_at DESC LIMIT 5"
+        ).fetchall()
+        for row in rows:
+            m = TASK_MARKER_PATTERN.search(row["message"])
+            if m:
+                task_text = m.group(1).strip()
+                if task_text:
+                    return task_text
+        return ""
+    except sqlite3.Error:
+        return ""
+
+
 def _get_last_peer_message(conn):
-    """查询 messages 表中来自对端的最新一条消息（排除 auto_reply）
+    """查询 messages 表中来自对端的最新一条消息
 
     用排除法：去掉自己发的（含本机 hostname）、去掉 127.0.0.1
     剩下的就是对端发来的。
@@ -160,11 +193,27 @@ def _get_recent_context_messages(conn, since_iso, limit=CONTEXT_MESSAGE_COUNT):
         return []
 
 
-def _send_wakeup(peer_host, context_messages=None, stall_timeout=STALL_TIMEOUT_MINUTES):
-    """发送唤醒消息到对端 Tether
+def _format_elapsed(seconds):
+    """将秒数格式化为可读的 elapsed 字符串"""
+    minutes = int(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours} 小时 {mins} 分钟"
 
-    用 type=info 直接 POST 到对端（不走 auto_reply 通道），
-    这样对端 watcher 会取出并处理。
+
+def _send_wakeup(peer_host, state, stall_timeout=STALL_TIMEOUT_MINUTES):
+    """发送带任务上下文的唤醒消息到对端 Tether
+
+    消息格式：
+      如果 state 中保存了 current_task：
+        [任务重启] 检测到对话卡住了，检查你目前的进度，并继续以下任务直到完成。
+        ---
+        {任务原文}
+        ---
+        最后消息来自 {sender}，已于 {elapsed} 前发送。
+      否则回退到通用 [呼叫-保活] 消息。
     """
     if not peer_host:
         log("⚠️ TETHER_PEER_HOST 未设置，无法发送唤醒")
@@ -172,21 +221,25 @@ def _send_wakeup(peer_host, context_messages=None, stall_timeout=STALL_TIMEOUT_M
 
     hostname = LOCAL_HOSTNAME
     nick = _get_sender_nick()
+    task_text = state.get("current_task", "")
 
-    # 构建唤醒消息
-    wakeup_parts = [
-        "[呼叫-保活] 检测到对话超过 {} 分钟无进展。".format(stall_timeout),
-        "请检查待处理消息并继续推进工作。如果任务已完成请忽略此消息。",
-    ]
-
-    if context_messages:
-        wakeup_parts.append("\n最近消息记录：")
-        for sender, msg, ts, mtype in context_messages:
-            short_sender = sender.split("(")[0].strip() if "(" in sender else sender
-            preview = (msg[:100] + "...") if len(msg) > 100 else msg
-            wakeup_parts.append(f"  [{ts[:19]}] {short_sender}: {preview}")
-
-    wakeup_text = "\n".join(wakeup_parts)
+    if task_text:
+        # 带任务上下文的唤醒
+        wakeup_text = (
+            "[任务重启] 检测到对话卡住了，检查你目前的进度，并继续以下任务直到完成。\n"
+            "---\n"
+            f"{task_text}\n"
+            "---\n"
+            f"最后一条消息来自 {state.get('last_wakeup_target', '对方')}，"
+            f"已等待 {_format_elapsed(stall_timeout * 60)} 无回复。"
+            "\n请检查实际完成情况，未完成的部分继续推进。完成后向主人汇报。"
+        )
+    else:
+        # 没有任务上下文时的通用唤醒
+        wakeup_text = (
+            "[任务重启] 检测到对话卡住了，请检查目前的进度并继续推进。"
+            "如果任务已完成请忽略此消息。"
+        )
 
     payload = json.dumps({
         "from": f"{hostname} ({nick})",
@@ -214,7 +267,8 @@ def _send_wakeup(peer_host, context_messages=None, stall_timeout=STALL_TIMEOUT_M
             with urllib.request.urlopen(req, timeout=10) as resp:
                 result = json.loads(resp.read().decode())
             msg_id = result.get("message_id", "?")
-            log(f"📤 唤醒已发送 → {host}:{PEER_PORT}  msg_id={msg_id[:8]}")
+            log(f"📤 唤醒已发送 → {host}:{PEER_PORT}  msg_id={msg_id[:8]}"
+                f"{'（带任务上下文）' if task_text else ''}")
             return True
         except Exception as e:
             last_err = str(e)[:80]
@@ -239,12 +293,19 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
             conn.close()
         return state
 
+    # v2: 每次检查时扫描新任务标记，提取任务上下文
+    new_task = _scan_new_task(conn)
+    if new_task:
+        log(f"📋 检测到新任务定义（{len(new_task)} chars）")
+        state["current_task"] = new_task
+
     # 1. 查询来自对端的最后一条消息
     last_msg = _get_last_peer_message(conn)
     if last_msg is None:
         log("📭 尚无来自对端的消息，跳过检查")
         conn.close()
         state["conversation_was_active"] = False
+        _save_state(state)
         return state
 
     last_time_iso, last_sender, last_content, last_type = last_msg
@@ -252,7 +313,6 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
 
     # 2. 计算对端最后消息距今多少分钟
     try:
-        # 支持多种 ISO 格式
         if last_time_iso.endswith("Z"):
             last_dt = datetime.fromisoformat(last_time_iso.replace("Z", "+00:00"))
         else:
@@ -261,13 +321,14 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
     except (ValueError, TypeError):
         log(f"⚠️ 无法解析时间戳: {last_time_iso}，跳过")
         conn.close()
+        _save_state(state)
         return state
 
     # 3. 判断是否在 activity_window 内有活跃对话
     activity_ago_iso = (datetime.now(timezone.utc).timestamp() - activity_window * 60)
     activity_ago_iso_str = datetime.fromtimestamp(activity_ago_iso, tz=timezone.utc).isoformat()
     recent_count = _get_recent_message_count(conn, activity_ago_iso_str)
-    had_recent_activity = recent_count >= 3  # 至少 3 条消息才算"有过对话"
+    had_recent_activity = recent_count >= 3
 
     # 更新状态中的 last_peer_msg_time
     state["last_peer_msg_time"] = last_time_iso
@@ -284,7 +345,6 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
     else:
         # 对端超过 TIMEOUT 无消息
         if had_recent_activity or state.get("conversation_was_active", False):
-            # 情况 A: 有过对话，现在停了 → 可能是卡住
             is_stalled = True
             stall_reason = (
                 f"对端 {elapsed_minutes:.0f} 分钟无消息"
@@ -295,7 +355,6 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
             state["conversation_was_active"] = False
             log(f"⚠️ 可能卡住: {stall_reason}")
         else:
-            # 情况 B: 本来就没活跃对话，双方都休息 → 正常
             state["conversation_was_active"] = False
             log(f"💤 对端 {elapsed_minutes:.0f} 分钟无消息（无近期活跃对话，跳过）")
 
@@ -309,23 +368,11 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
         if cooldown_remaining > 0 and same_target:
             log(f"⏭ 跳过唤醒（冷却中，剩余 {cooldown_remaining:.0f} 秒）")
         else:
-            # 获取上下文消息（重新打开连接，之前的已关闭）
-            since_iso = (datetime.fromtimestamp(
-                time.time() - activity_window * 60, tz=timezone.utc
-            ).isoformat())
-            _ctx_conn = _get_db()
-            ctx = _get_recent_context_messages(
-                _ctx_conn, since_iso, CONTEXT_MESSAGE_COUNT
-            ) if had_recent_activity and _ctx_conn else []
-            if _ctx_conn:
-                _ctx_conn.close()
-
-            ok = _send_wakeup(peer_host, ctx, stall_timeout)
+            ok = _send_wakeup(peer_host, state, stall_timeout)
             if ok:
                 state["last_wakeup_time"] = now
                 state["last_wakeup_target"] = peer_host
 
-        # 连续多次卡住 → 可以在这里扩展：通知主人
         if state["consecutive_stalls"] >= 3:
             log(f"🔔 连续 {state['consecutive_stalls']} 次检测到卡住（可配置主人通知）")
     elif is_stalled and not peer_host:
@@ -340,12 +387,15 @@ def watch_loop(interval=DEFAULT_POLL_INTERVAL,
                cooldown=COOLDOWN_MINUTES,
                activity_window=ACTIVITY_WINDOW_MINUTES):
     """持续监控循环"""
-    log(f"🐾 Tether Alive 启动 (间隔={interval}s, 超时={stall_timeout}min)")
+    log(f"🐾 Tether Alive v2 启动 (间隔={interval}s, 超时={stall_timeout}min)")
     log(f"   冷却={cooldown}min, 活跃窗口={activity_window}min")
+    log(f"   任务上下文提取: {'{(新任务)}...{(完)}'}")
     log(f"   DB={DB_PATH}")
     log(f"   唤醒目标={_get_peer_host() or '未设置(仅检查模式)'}")
 
     state = _load_state()
+    if state.get("current_task"):
+        log(f"   当前保存的任务: {state['current_task'][:60]}...")
 
     while True:
         try:
@@ -358,7 +408,7 @@ def watch_loop(interval=DEFAULT_POLL_INTERVAL,
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Tether Alive — 对话活性监控 + 保活唤醒"
+        description="Tether Alive v2 — 对话活性监控 + 带任务上下文的保活唤醒"
     )
     parser.add_argument("--watch", action="store_true",
                         help="持续监控模式（默认只跑一次）")
