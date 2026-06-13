@@ -1,0 +1,15 @@
+[Unit]
+Description=Tether Alive — 对话活性监控 + 保活唤醒
+After=tether-watcher.service
+# 不绑定（BindsTo），任一服务崩溃/重启不应连带杀死对方
+
+[Service]
+Type=simple
+ExecStart=/home/zzsky/.hermes/tether/tether_alive.py --watch
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

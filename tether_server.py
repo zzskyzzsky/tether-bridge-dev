@@ -104,16 +104,16 @@ def receive():
             "INSERT INTO messages (id, sender, message, received_at, type, acked) VALUES (?,?,?,?,?,0)",
             (msg_id, sender, content, _now(), msg_type))
 
+    # 统一处理 in_reply_to（无论消息类型，自动确认对方的出站消息）
+    in_reply_to = data.get("in_reply_to")
+    if in_reply_to:
+        with _db() as conn:
+            conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (in_reply_to,))
+
     if msg_type == "auto_reply":
-        # auto_reply：存但立即 acked（只是 audit trail，不需要 watcher 处理）
+        # auto_reply：旧格式立即 acked，仅审计轨迹，不触发 watcher
         with _db() as conn:
             conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
-        # 检查是否有 in_reply_to，自动 ack 对方的 outgoing_messages
-        in_reply_to = data.get("in_reply_to")
-        if in_reply_to:
-            with _db() as conn:
-                conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (in_reply_to,))
-            print(f"✅ auto_reply in_reply_to={in_reply_to[:8]} → outgoing acked")
     elif msg_type == "handoff":
         # handoff：存 SQLite + 写 handoff 文件，不触发 Watcher notify
         # watcher 在主轮询中独立检查 handoff 文件

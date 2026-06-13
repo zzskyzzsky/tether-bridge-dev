@@ -591,8 +591,9 @@ def _auto_reply(output, sender_info, original_msg_id=None):
         "sender": f"{hostname} ({sender_nick})",
         "message": reply_text,
         "content": reply_text,
-        "type": "auto_reply",
-        "ttl": 1,  # auto_reply 也带 TTL，防止回环
+        "type": "info",       # 改 info 让对端 watcher 可见
+        "is_reply": True,     # 标记为回复消息，对端跳过 auto-reply-back 防回环
+        "ttl": 1,
     }).encode()
 
     # 如果有 original_msg_id，payload 中带 in_reply_to 字段
@@ -720,14 +721,19 @@ def process_messages():
             else:
                 log(f"❌ Gateway 不在线，消息跳过")
 
-            # 汇报或自动回复：Report 发 DingTalk，其他回发送方
+            # 汇报或自动回复：Report 发 notification，其他回发送方
             if output and sender:
                 if _should_report(output):
-                    log(f"🔔 {mid} 标记为 Report → 走 DingTalk 通知")
+                    log(f"🔔 {mid} 标记为 Report → 走通知")
                     _send_dingtalk(output)
 
-                # 所有消息都 auto-reply 回发送方
-                _auto_reply(output, sender, msg.get("id", ""))
+                # is_reply 消息跳过 auto-reply，防止回环
+                # 对端 watcher 已处理过，我们 Gateway 收到上下文即可继续推进
+                if not is_reply:
+                    _auto_reply(output, sender, msg.get("id", ""))
+                else:
+                    if output:
+                        log(f"⏭ {mid} 跳过 auto-reply（is_reply 消息）")
 
         log(f"✅ 本轮处理完成 ({len(msgs)} 条)")
         return len(msgs)
@@ -850,7 +856,8 @@ def _check_outgoing_retry():
             "sender": f"{hostname} ({sender_nick})",
             "message": msg_text,
             "content": msg_text,
-            "type": "auto_reply",
+            "type": "info",
+            "is_reply": True,
             "ttl": 1,
         }).encode()
         peer_url = f"http://{target_host}:{PEER_PORT}/message"
