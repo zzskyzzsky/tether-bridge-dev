@@ -5,7 +5,7 @@
 """
 import json, os, socket, sqlite3
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, send_file, request
+from flask import Flask, jsonify, send_file
 
 app = Flask(__name__)
 
@@ -66,6 +66,13 @@ def _parse_sender(sender_str):
     return sender_str[:15]
 
 
+def _route_str(from_name, to_name):
+    """构建 sender → receiver 字符串"""
+    if from_name == "relay":
+        # 来源不明，经过 relay
+        return f"relay → {to_name}"
+    return f"{from_name} → {to_name}"
+
 
 def _parse_target(target_host):
     """从 target_host 解析显示名"""
@@ -104,9 +111,11 @@ def _collect_messages():
         frm = _parse_sender(m["sender"])
         to = LOCAL_NAME
         via_relay = frm == "relay"
-        # relay 消息：原始 sender 是对端
-        orig = PEER_NAME if via_relay else frm
-        route = f"{orig} → relay → {to}" if via_relay else f"{orig} → {to}"
+        if via_relay:
+            # relay 消息：原始发送方是对端（PEER_NAME）
+            route = f"{PEER_NAME} → relay → {to}"
+        else:
+            route = _route_str_full(frm, to, False)
         results.append({
             "id": m["id"],
             "dir": "in",
@@ -126,11 +135,15 @@ def _collect_messages():
         "FROM outgoing_messages ORDER BY sent_at ASC"
     )
     for m in out_msgs:
-        raw_to = _parse_target(m["target_host"])
-        via_relay = raw_to == "relay"
         frm = LOCAL_NAME
-        to = PEER_NAME if via_relay else raw_to
-        route = _route_str_full(frm, to, via_relay)
+        to = _parse_target(m["target_host"])
+        if to == "relay":
+            # 发送到 relay：显示 LOCAL → relay
+            route = f"{frm} → relay"
+            via_relay = True
+        else:
+            route = _route_str_full(frm, to, False)
+            via_relay = False
         results.append({
             "id": m["id"],
             "dir": "out",
@@ -159,18 +172,12 @@ def index():
 @app.route("/api/messages")
 def get_messages():
     try:
-        refresh = request.args.get("refresh", "10")
-        try:
-            refresh_int = max(3, min(120, int(refresh)))
-        except ValueError:
-            refresh_int = 10
         msgs = _collect_messages()
         return jsonify({
             "messages": msgs,
             "count": len(msgs),
             "hostname": HOSTNAME,
             "local_name": LOCAL_NAME,
-            "refresh": refresh_int,
         })
     except Exception as e:
         return jsonify({"error": str(e), "messages": []})
