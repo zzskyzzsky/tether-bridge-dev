@@ -675,10 +675,13 @@ def process_messages():
             content = msg.get("message", "")
             log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
 
-            # 跳过 auto_reply 类型消息（防止 watcher 间自动回复回环）
+            # 跳过 auto_reply 类型消息（旧格式安全兜底，新格式走 is_reply 逻辑）
             if msg.get("type") == "auto_reply":
-                log(f"\u23ed {mid} 跳过（auto_reply 类型，防止回环）")
+                log(f"\u23ed {mid} 跳过（旧格式 auto_reply）")
                 continue
+
+            # 检查 is_reply 标记：回复消息处理但不 auto-reply 回去（防回环）
+            is_reply = msg.get("is_reply", False)
 
             # TTL 防死循环：检查 relay 消息的 TTL
             ttl = msg.get("ttl")
