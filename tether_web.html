@@ -89,6 +89,10 @@ body {
     <span id="countLabel">0</span>
     <span id="nextRefresh">10s</span>
     <span id="localLabel"></span>
+    <span style="font-size:12px;color:var(--text-muted)">
+      <label>刷新(s): <input id="refreshInput" type="number" min="1" max="300" value="10" style="width:50px;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-size:12px"></label>
+      <button onclick="setRefresh()" style="background:var(--accent);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:12px;cursor:pointer;margin-left:4px">设定</button>
+    </span>
   </div>
 </div>
 <div class="container">
@@ -97,9 +101,35 @@ body {
   </div>
 </div>
 <script>
-const POLL = 10000; // 10秒
+const POLL = 10000; // default 10秒，可通过页面设定修改
 let isLoading = false, countdown = 10, localName = '';
-let prevCount = 0;
+let prevCount = 0, pollInterval = 10000;
+
+function getRefreshSec() {
+  const v = parseInt(document.getElementById('refreshInput').value, 10);
+  return (v >= 1 && v <= 300) ? v : 10;
+}
+
+function setRefresh() {
+  const sec = getRefreshSec();
+  pollInterval = sec * 1000;
+  countdown = sec;
+  document.getElementById('nextRefresh').textContent = sec + 's';
+  localStorage.setItem('tether_web_refresh', sec);
+}
+
+// 从 localStorage 恢复刷新间隔
+(function() {
+  const saved = localStorage.getItem('tether_web_refresh');
+  if (saved) {
+    const sec = parseInt(saved, 10);
+    if (sec >= 1 && sec <= 300) {
+      document.getElementById('refreshInput').value = sec;
+      pollInterval = sec * 1000;
+      countdown = sec;
+    }
+  }
+})();
 
 function escapeHtml(t) {
   const d = document.createElement('div'); d.textContent = t; return d.innerHTML;
@@ -205,7 +235,7 @@ function tick() {
   const el = document.getElementById('nextRefresh');
   if (countdown <= 0) {
     el.textContent = '0s';
-    countdown = 10;
+    countdown = Math.round(pollInterval / 1000);
     fetchMessages();
   } else {
     el.textContent = countdown + 's';
