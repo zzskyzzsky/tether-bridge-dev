@@ -932,6 +932,8 @@ def _check_handoff_timeout():
         return
 
     now = time.time()
+    hostname = __import__("socket").gethostname()
+    sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
     for msg_id, target_host, msg_text in rows:
         # 去重：同一消息在 COOLDOWN 内不重复唤醒
         if msg_id in _HANDOFF_TIMEOUT_CACHE:
