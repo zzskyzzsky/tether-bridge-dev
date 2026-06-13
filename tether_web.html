@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tether 消息</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #e6edf3; --text-dim: #8b949e; --text-muted: #6e7681;
+  --accent: #58a6ff;
+  --mac-color: #3fb950;
+  --tp-color: #58a6ff;
+  --relay-color: #d29922;
+  --info-bg: rgba(88,166,255,0.12);   --info-border: rgba(88,166,255,0.3);
+  --handoff-bg: rgba(210,153,34,0.15); --handoff-border: rgba(210,153,34,0.35);
+  --reply-bg: rgba(63,185,80,0.12);   --reply-border: rgba(63,185,80,0.3);
+  --other-bg: rgba(139,148,158,0.1);  --other-border: rgba(139,148,158,0.25);
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+  background: var(--bg); color: var(--text); min-height: 100vh;
+}
+.header {
+  position: sticky; top: 0; z-index: 10;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+  padding: 12px 20px; display: flex; align-items: center;
+  justify-content: space-between; flex-wrap: wrap; gap: 8px;
+}
+.header h1 { font-size: 18px; font-weight: 600; }
+.header-info {
+  display: flex; align-items: center; gap: 14px;
+  font-size: 13px; color: var(--text-dim); flex-wrap: wrap;
+}
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.dot.online { background: var(--mac-color); }
+.dot.offline { background: #f85149; }
+.container { max-width: 820px; margin: 0 auto; padding: 12px; }
+.msg-list { display: flex; flex-direction: column; gap: 4px; }
+.msg-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 14px; transition: border-color 0.15s;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.msg-card:hover { border-color: var(--text-muted); }
+.msg-card.type-info { border-left: 3px solid var(--accent); }
+.msg-card.type-handoff { border-left: 3px solid var(--relay-color); }
+.msg-card.type-auto_reply { border-left: 3px solid var(--mac-color); }
+.msg-card.type-reply { border-left: 3px solid #d2a8ff; }
+
+.msg-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 13px;
+}
+.msg-time { color: var(--text-muted); font-size: 12px; white-space: nowrap; font-family: monospace; }
+.msg-route { font-size: 13px; font-weight: 500; }
+.msg-src-mac { color: var(--mac-color); }
+.msg-src-tp { color: var(--tp-color); }
+.msg-src-relay { color: var(--relay-color); }
+.msg-arrow { color: var(--text-muted); }
+.type-badge {
+  font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 8px;
+  text-transform: uppercase; letter-spacing: 0.4px;
+}
+.type-badge.info { background: var(--info-bg); color: var(--accent); }
+.type-badge.handoff { background: var(--handoff-bg); color: var(--relay-color); }
+.type-badge.auto_reply { background: var(--reply-bg); color: var(--mac-color); }
+.type-badge.reply { background: var(--reply-bg); color: #d2a8ff; }
+.msg-content {
+  font-size: 14px; line-height: 1.5; word-break: break-word; white-space: pre-wrap;
+  color: var(--text); padding-left: 0;
+}
+.empty {
+  text-align: center; color: var(--text-muted); padding: 60px 20px; font-size: 15px;
+}
+.error { text-align: center; color: #f85149; padding: 40px 20px; font-size: 14px; }
+.loading { text-align: center; color: var(--text-muted); padding: 20px; font-size: 14px; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.loading { animation: pulse 1.5s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>📡 Tether</h1>
+  <div class="header-info">
+    <span class="dot online" id="statusDot"></span>
+    <span id="statusText">在线</span>
+    <span id="countLabel">0</span>
+    <span id="nextRefresh">10s</span>
+    <span id="localLabel"></span>
+  </div>
+</div>
+<div class="container">
+  <div id="msgList" class="msg-list">
+    <div class="loading">加载中...</div>
+  </div>
+</div>
+<script>
+const POLL = 10000; // 10秒
+let isLoading = false, countdown = 10, localName = '';
+let prevCount = 0;
+
+function escapeHtml(t) {
+  const d = document.createElement('div'); d.textContent = t; return d.innerHTML;
+}
+
+function srcClass(name) {
+  const n = (name || '').toLowerCase();
+  if (n === 'mac') return 'msg-src-mac';
+  if (n === 'tp') return 'msg-src-tp';
+  if (n === 'relay') return 'msg-src-relay';
+  return '';
+}
+
+function colorRoute(route) {
+  // Segment-based: split by →, color each segment individually
+  const segs = route.split('→');
+  const colored = segs.map(function(s) {
+    s = s.trim();
+    if (s === 'mac') return '<span class="msg-src-mac">mac</span>';
+    if (s === 'tp') return '<span class="msg-src-tp">tp</span>';
+    if (s === 'relay') return '<span class="msg-src-relay">relay</span>';
+    return '<span>' + s + '</span>';
+  });
+  return colored.join('<span class="msg-arrow"> → </span>');
+}
+
+function typeClass(t) {
+  const tt = (t || '').toLowerCase();
+  if (tt === 'info') return 'info';
+  if (tt === 'handoff') return 'handoff';
+  if (tt === 'auto_reply' || tt === 'reply') return 'auto_reply';
+  return '';
+}
+
+function renderMessages(msgs) {
+  const el = document.getElementById('msgList');
+  // msgs already sorted ASC (oldest first) from backend
+  if (!msgs || msgs.length === 0) {
+    el.innerHTML = '<div class="empty">暂无消息</div>';
+    document.getElementById('countLabel').textContent = '0';
+    return;
+  }
+
+  const isNew = msgs.length !== prevCount;
+  prevCount = msgs.length;
+
+  let html = '';
+  for (const m of msgs) {
+    const time = escapeHtml(m.time_bj || '');
+    const routeHtml = colorRoute(escapeHtml(m.route || ''));
+    const content = escapeHtml(m.message || '');
+    const type = typeClass(m.type);
+    const typeLabel = (m.type || 'info');
+
+    html += `
+      <div class="msg-card type-${type}">
+        <div class="msg-row">
+          <span class="msg-time">${time}</span>
+          <span class="type-badge ${type}">${escapeHtml(typeLabel)}</span>
+          <span class="msg-route">${routeHtml}</span>
+        </div>
+        <div class="msg-content">${content}</div>
+      </div>`;
+  }
+  el.innerHTML = html;
+  document.getElementById('countLabel').textContent = msgs.length;
+
+  // Auto-scroll to bottom (newest messages)
+  window.scrollTo({ top: document.body.scrollHeight, behavior: isNew ? 'smooth' : 'auto' });
+}
+
+function setOnline(ok) {
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('statusText');
+  dot.className = 'dot ' + (ok ? 'online' : 'offline');
+  txt.textContent = ok ? '在线' : '离线';
+}
+
+async function fetchMessages() {
+  if (isLoading) return;
+  isLoading = true;
+  try {
+    const resp = await fetch('/api/messages');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    if (data.error) { setOnline(false); return; }
+    const msgs = data.messages || [];
+    if (!localName && data.local_name) {
+      localName = data.local_name;
+      document.getElementById('localLabel').textContent = localName;
+    }
+    renderMessages(msgs);
+    setOnline(true);
+  } catch (e) {
+    document.getElementById('msgList').innerHTML =
+      '<div class="error">连接失败: ' + escapeHtml(e.message || '') + '</div>';
+    setOnline(false);
+  }
+  isLoading = false;
+}
+
+function tick() {
+  const el = document.getElementById('nextRefresh');
+  if (countdown <= 0) {
+    el.textContent = '0s';
+    countdown = 10;
+    fetchMessages();
+  } else {
+    el.textContent = countdown + 's';
+    countdown--;
+  }
+}
+
+// Start
+fetchMessages();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
