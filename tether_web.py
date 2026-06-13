@@ -51,9 +51,14 @@ def _normalize_name(name):
         return "relay"
     if "zzsky-mbp" in n or "zzsky-mac" in n or "mac-弟弟" in n or "mac-小钉" in n or n == "mac":
         return "mac"
-    if "zzskytpg3" in n or "zzskytpg" in n or "tp-哥哥" in n or "tp-小钉" in n or n == "tp":
+    if "zzskytpg3" in n or "zzskytpg" in n or "zzskytp" in n or "tp-哥哥" in n or "tp-小钉" in n or "tp-thinkpad" in n or n == "tp":
         return "tp"
     if "tp" in n:
+        return "tp"
+    # Tailscale IPs
+    if "100.81.192.38" in n:
+        return "mac"
+    if "100.102.54.90" in n:
         return "tp"
     return name[:15]
 
@@ -81,7 +86,7 @@ def _collect_messages():
             route = f"{frm} → relay → {PEER_NAME}"
             via_relay = True
         else:
-            to = "mac" if "mbp" in to_raw or "100.81" in to_raw else "tp" if "tpg" in to_raw or "100.102" in to_raw else m["target_host"][:10]
+            to = _normalize_name(m["target_host"])
             route = _route_str_full(frm, to, False)
             via_relay = False
         results.append({"id": m["id"], "dir": "out", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": "info", "message": m["message"], "source": "local"})
