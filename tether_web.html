@@ -87,7 +87,7 @@ body {
     <span class="dot online" id="statusDot"></span>
     <span id="statusText">在线</span>
     <span id="countLabel">0</span>
-    <span id="nextRefresh">10s</span>
+    <span id="nextRefresh">${POLL/1000}s</span>
     <span id="localLabel"></span>
   </div>
 </div>
@@ -97,8 +97,10 @@ body {
   </div>
 </div>
 <script>
-const POLL = 10000; // 10秒
-let isLoading = false, countdown = 10, localName = '';
+// 刷新间隔：URL 参数 ?refresh=N（秒），默认 10 秒
+const urlParams = new URLSearchParams(window.location.search);
+const POLL = (parseInt(urlParams.get('refresh')) || 10) * 1000;
+let isLoading = false, countdown = POLL / 1000, localName = '';
 let prevCount = 0;
 
 function escapeHtml(t) {
@@ -205,7 +207,7 @@ function tick() {
   const el = document.getElementById('nextRefresh');
   if (countdown <= 0) {
     el.textContent = '0s';
-    countdown = 10;
+    countdown = POLL / 1000;
     fetchMessages();
   } else {
     el.textContent = countdown + 's';

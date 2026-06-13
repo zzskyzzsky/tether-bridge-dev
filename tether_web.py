@@ -112,8 +112,8 @@ def _collect_messages():
         to = LOCAL_NAME
         via_relay = frm == "relay"
         if via_relay:
-            # relay 消息：不知道原始 sender，显示 relay → local
-            route = f"relay → {to}"
+            # relay 消息：原始发送方是对端（PEER_NAME）
+            route = f"{PEER_NAME} → relay → {to}"
         else:
             route = _route_str_full(frm, to, False)
         results.append({
@@ -137,8 +137,13 @@ def _collect_messages():
     for m in out_msgs:
         frm = LOCAL_NAME
         to = _parse_target(m["target_host"])
-        via_relay = to == "relay"
-        route = _route_str_full(frm, to, via_relay)
+        if to == "relay":
+            # 发送到 relay：显示 LOCAL → relay
+            route = f"{frm} → relay"
+            via_relay = True
+        else:
+            route = _route_str_full(frm, to, False)
+            via_relay = False
         results.append({
             "id": m["id"],
             "dir": "out",
