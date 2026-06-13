@@ -87,7 +87,12 @@ body {
     <span class="dot online" id="statusDot"></span>
     <span id="statusText">在线</span>
     <span id="countLabel">0</span>
-    <span id="nextRefresh">${POLL/1000}s</span>
+    <span id="nextRefresh">10s</span>
+    <label style="font-size:13px;color:var(--text-dim)">
+      刷新: <input type="number" id="refreshInput" value="10" min="3" max="120"
+             style="width:50px;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:12px">
+      <span style="cursor:pointer;color:var(--accent);margin-left:4px" onclick="applyRefresh()">应用</span>
+    </label>
     <span id="localLabel"></span>
   </div>
 </div>
