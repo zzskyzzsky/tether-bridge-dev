@@ -5,7 +5,7 @@
 """
 import json, os, socket, sqlite3, urllib.request
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -67,7 +67,7 @@ def _route_str_full(from_name, to_name, via_relay):
         return f"{from_name} → relay → {to_name}"
     return f"{from_name} → {to_name}"
 
-def _collect_messages():
+def _collect_messages(no_peer=False):
     results = []
     in_msgs = _query("SELECT id, sender, message, received_at AS time, type, acked FROM messages ORDER BY received_at ASC")
     for m in in_msgs:
@@ -91,12 +91,11 @@ def _collect_messages():
             via_relay = False
         results.append({"id": m["id"], "dir": "out", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": "info", "message": m["message"], "source": "local"})
 
-    if PEER_WEB_URL:
+    if PEER_WEB_URL and not no_peer:
         try:
-            req = urllib.request.Request(f"{PEER_WEB_URL}/api/messages")
+            req = urllib.request.Request(f"{PEER_WEB_URL}/api/messages?no_peer=1")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 peer_data = json.loads(resp.read().decode())
-            # 用 (message前100字, time) 作为去重键（不同机器 UUID 不同）
             local_keys = {(r["message"][:100], r["time"]) for r in results}
             for pm in peer_data.get("messages", []):
                 key = (pm["message"][:100], pm["time"])
@@ -117,8 +116,9 @@ def index():
 
 @app.route("/api/messages")
 def get_messages():
+    no_peer = request.args.get("no_peer", "0") == "1"
     try:
-        msgs = _collect_messages()
+        msgs = _collect_messages(no_peer=no_peer)
         return jsonify({"messages": msgs, "count": len(msgs), "hostname": HOSTNAME, "local_name": LOCAL_NAME})
     except Exception as e:
         return jsonify({"error": str(e), "messages": []})
