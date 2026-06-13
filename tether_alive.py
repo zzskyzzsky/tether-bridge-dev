@@ -48,6 +48,21 @@ ACTIVITY_WINDOW_MINUTES = 20       # 在此窗口内有对话记录才算"活跃
 
 PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
 LOCAL_HOSTNAME = socket.gethostname()
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
+
+# 从 .env 读取 Gateway API Key
+_GATEWAY_API_KEY = ""
+_env_path = os.path.expanduser("~/.hermes/.env")
+if os.path.isfile(_env_path):
+    try:
+        with open(_env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("API_SERVER_KEY="):
+                    _GATEWAY_API_KEY = line.split("=", 1)[1].strip()
+                    break
+    except Exception:
+        pass
 
 # 唤醒时包含的最近消息条数
 CONTEXT_MESSAGE_COUNT = 3
@@ -201,6 +216,57 @@ def _format_elapsed(seconds):
     hours = minutes // 60
     mins = minutes % 60
     return f"{hours} 小时 {mins} 分钟"
+
+
+def _fetch_task_from_gateway():
+    """询问本机 Gateway 从对话历史中提取最近的任务描述
+
+    当 tether_alive 需要唤醒但 current_task 为空时调用。
+    Gateway 的 session 中包含了飞书等渠道的原始消息，
+    可以从中提取出 {(新任务)}...{(完)} 格式的任务定义。
+    """
+    if not _GATEWAY_API_KEY:
+        return ""
+
+    prompt = (
+        "Scan your recent conversation history with the owner. "
+        "If the owner assigned a new task using the format "
+        "{(新任务)}...{(完)}, extract and return the COMPLETE task text "
+        "between those markers, including the markers themselves. "
+        "If you find multiple, return the most recent one. "
+        "If no task was found, return exactly: NO_TASK_FOUND"
+    )
+
+    url = f"{GATEWAY_URL}/api/sessions/tether-alive-task/chat"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {_GATEWAY_API_KEY}",
+    }
+    payload = json.dumps({"message": prompt, "title": "tether-alive-task", "id": "tether-alive-task"}).encode()
+
+    # 先创建 session
+    try:
+        req = urllib.request.Request(
+            GATEWAY_URL + "/api/sessions",
+            data=json.dumps({"title": "tether-alive-task", "id": "tether-alive-task"}).encode(),
+            headers=headers, method="POST"
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # session may already exist (409)
+
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+        content = result.get("message", {}).get("content", "").strip()
+        if content and content != "NO_TASK_FOUND":
+            log(f"📋 从 Gateway 提取到任务定义（{len(content)} chars）")
+            return content
+        return ""
+    except Exception as e:
+        log(f"⏳ Gateway 任务提取失败: {str(e)[:60]}")
+        return ""
 
 
 def _send_wakeup(peer_host, state, stall_timeout=STALL_TIMEOUT_MINUTES):
@@ -368,6 +434,15 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
         if cooldown_remaining > 0 and same_target:
             log(f"⏭ 跳过唤醒（冷却中，剩余 {cooldown_remaining:.0f} 秒）")
         else:
+            # 如果还没有任务上下文，尝试从 Gateway 提取
+            if not state.get("current_task"):
+                log("📋 current_task 为空，尝试从 Gateway 提取任务描述...")
+                task = _fetch_task_from_gateway()
+                if task:
+                    state["current_task"] = task
+                else:
+                    log("⚠️ Gateway 未返回任务定义，将使用通用唤醒")
+
             ok = _send_wakeup(peer_host, state, stall_timeout)
             if ok:
                 state["last_wakeup_time"] = now
