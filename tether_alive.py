@@ -309,13 +309,16 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
         if cooldown_remaining > 0 and same_target:
             log(f"⏭ 跳过唤醒（冷却中，剩余 {cooldown_remaining:.0f} 秒）")
         else:
-            # 获取上下文消息
+            # 获取上下文消息（重新打开连接，之前的已关闭）
             since_iso = (datetime.fromtimestamp(
                 time.time() - activity_window * 60, tz=timezone.utc
             ).isoformat())
+            _ctx_conn = _get_db()
             ctx = _get_recent_context_messages(
-                None, since_iso, CONTEXT_MESSAGE_COUNT
-            ) if had_recent_activity else []
+                _ctx_conn, since_iso, CONTEXT_MESSAGE_COUNT
+            ) if had_recent_activity and _ctx_conn else []
+            if _ctx_conn:
+                _ctx_conn.close()
 
             ok = _send_wakeup(peer_host, ctx, stall_timeout)
             if ok:
