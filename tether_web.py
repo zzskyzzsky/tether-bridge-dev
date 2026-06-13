@@ -138,8 +138,8 @@ def _collect_messages():
         frm = LOCAL_NAME
         to = _parse_target(m["target_host"])
         if to == "relay":
-            # 发送到 relay：显示 LOCAL → relay
-            route = f"{frm} → relay"
+            # 发送到 relay：显示 LOCAL → relay → PEER
+            route = f"{frm} → relay → {PEER_NAME}"
             via_relay = True
         else:
             route = _route_str_full(frm, to, False)
