@@ -550,6 +550,16 @@ def _auto_reply(output, sender_info, original_msg_id=None):
             log("⚠️ TETHER_PEER_HOST 未设置且 sender 无主机名 → auto-reply 跳过，请设置 TETHER_PEER_HOST=对方主机名")
             return
 
+    # 检查 target_host 是否含非 ASCII 字符（如纯中文昵称），有则回退到 PEER_HOST
+    if any(ord(c) > 127 for c in target_host):
+        fallback = os.environ.get("TETHER_PEER_HOST", "")
+        if fallback and fallback != target_host:
+            log(f"⏭ target_host 含非 ASCII 字符 ({target_host})，回退到 TETHER_PEER_HOST={fallback}")
+            target_host = fallback
+        else:
+            log(f"⚠️ target_host 含非 ASCII 字符 ({target_host})，且无 TETHER_PEER_HOST 回退，跳过 auto-reply")
+            return
+
     # 跳过自己发给自己的消息（防止回环）
     local_hostname = __import__("socket").gethostname()
     if target_host == local_hostname:
@@ -852,6 +862,17 @@ def _check_outgoing_retry():
         return
 
     for msg_id, target_host, msg_text, sender in rows:
+        # 跳过含非 ASCII 字符的目标（如中文昵称），直接标记 acked 防止循环重试
+        if any(ord(c) > 127 for c in target_host):
+            try:
+                conn2 = sqlite3.connect(db_path, timeout=3)
+                conn2.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (msg_id,))
+                conn2.commit()
+                conn2.close()
+                log(f"⏭ 跳过不可送达目标: {target_host}（标记 acked）")
+            except Exception:
+                pass
+            continue
         hostname = __import__("socket").gethostname()
         sender_nick = os.environ.get("TETHER_SENDER_NICK", hostname)
         payload = json.dumps({
