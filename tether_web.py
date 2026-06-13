@@ -42,22 +42,20 @@ def _fmt_bj(iso_str):
     except Exception:
         return iso_str[:17]
 
-def _parse_sender(sender_str):
-    if not sender_str:
+def _normalize_name(name):
+    """将任意 sender/target 字符串归一化为 tp/mac/relay/unknown"""
+    if not name:
         return "?"
-    s_lower = sender_str.lower()
-    if any(r in s_lower for r in RELAY_NAMES):
+    n = name.strip().lower()
+    if any(r in n for r in RELAY_NAMES):
         return "relay"
-    host_part = sender_str.split()[0].strip() if " " in sender_str else sender_str.strip()
-    if "zzsky-mbp" in s_lower or "zzsky-mac" in s_lower or "mac-弟弟" in s_lower or "mac-小钉" in s_lower or host_part in ("mac",):
+    if "zzsky-mbp" in n or "zzsky-mac" in n or "mac-弟弟" in n or "mac-小钉" in n or n == "mac":
         return "mac"
-    if "zzskytpg3" in s_lower or "zzskytpg" in s_lower or "tp-哥哥" in s_lower or "tp-小钉" in s_lower or host_part in ("tp",):
+    if "zzskytpg3" in n or "zzskytpg" in n or "tp-哥哥" in n or "tp-小钉" in n or n == "tp":
         return "tp"
-    if host_part in ("mac", "zzsky-mbp"):
-        return "mac"
-    if host_part in ("tp", "zzskytpg3"):
+    if "tp" in n:
         return "tp"
-    return host_part[:15]
+    return name[:15]
 
 def _route_str_full(from_name, to_name, via_relay):
     if via_relay:
@@ -68,7 +66,7 @@ def _collect_messages():
     results = []
     in_msgs = _query("SELECT id, sender, message, received_at AS time, type, acked FROM messages ORDER BY received_at ASC")
     for m in in_msgs:
-        frm = _parse_sender(m["sender"])
+        frm = _normalize_name(m["sender"])
         to = LOCAL_NAME
         via_relay = frm == "relay"
         route = f"{PEER_NAME} → relay → {to}" if via_relay else _route_str_full(frm, to, False)
@@ -93,10 +91,12 @@ def _collect_messages():
             req = urllib.request.Request(f"{PEER_WEB_URL}/api/messages")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 peer_data = json.loads(resp.read().decode())
+            # 用 (message前100字, time) 作为去重键（不同机器 UUID 不同）
+            local_keys = {(r["message"][:100], r["time"]) for r in results}
             for pm in peer_data.get("messages", []):
-                if pm["source"] == "local":
+                key = (pm["message"][:100], pm["time"])
+                if key not in local_keys:
                     pm["source"] = "peer"
-                if not any(r["id"] == pm["id"] for r in results):
                     results.append(pm)
         except Exception:
             pass
