@@ -102,11 +102,21 @@ body {
   </div>
 </div>
 <script>
-// 刷新间隔：URL 参数 ?refresh=N（秒），默认 10 秒
-const urlParams = new URLSearchParams(window.location.search);
-const POLL = (parseInt(urlParams.get('refresh')) || 10) * 1000;
+// 刷新间隔：默认 10 秒
+let POLL = 10000;
+try { const r = parseInt(localStorage.getItem('tether_refresh')) || 10; POLL = r * 1000; } catch(e){}
+document.getElementById('refreshInput').value = POLL / 1000;
 let isLoading = false, countdown = POLL / 1000, localName = '';
 let prevCount = 0;
+
+function applyRefresh() {
+  const v = parseInt(document.getElementById('refreshInput').value) || 10;
+  const clamped = Math.max(3, Math.min(120, v));
+  document.getElementById('refreshInput').value = clamped;
+  POLL = clamped * 1000;
+  countdown = clamped;
+  localStorage.setItem('tether_refresh', String(clamped));
+}
 
 function escapeHtml(t) {
   const d = document.createElement('div'); d.textContent = t; return d.innerHTML;
