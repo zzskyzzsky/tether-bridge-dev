@@ -192,3 +192,50 @@ systemctl --user restart tether-watcher.service
 1. 手动停掉一端 watcher: `systemctl --user stop tether-watcher.service`
 2. 清理积压: `sqlite3 ~/.hermes/tether/tether.db "DELETE FROM messages"`
 3. 重启: `systemctl --user start tether-watcher.service`
+
+---
+
+## 任务分配格式
+
+在飞书群分配新任务时，使用 `{(新任务)}...{(完)}` 格式。tether_alive 会自动识别并保存任务上下文，卡住时唤醒消息会携带任务原文。
+
+发送任务后，附加一句让 agent 用 tether_send 存入消息表：
+
+```
+请tp和mac各自执行 tether_send --host 127.0.0.1 --type info，把{(新任务)}和{(完)}之间的内容一字不改地作为消息原文。
+```
+
+### 完成标记
+
+任务完成后，agent 在汇报消息中包含 `{(完成)}`。tether_alive 检测到后会自动清空 `current_task`，不再为已完成的任务发送唤醒。
+
+### 自证模式（推荐）
+
+不需要你设计验证步骤，让 agent 自己定方案、自己执行、自己贴结果：
+
+```
+{(新任务)}
+任务描述...（可以很模糊，细节让 agent 自己定）
+
+完成后，先输出验证方案，再执行验证：
+1. 列出你打算检查什么、用什么命令、预期输出是什么
+2. 执行这些命令
+3. 把实际输出贴出来
+
+汇报时在消息中包含 {(完成)}。然后 tp 在飞书 @我 汇报。
+
+{(完)}
+
+请tp和mac各自执行 tether_send --host 127.0.0.1 --type info，把{(新任务)}和{(完)}之间的内容一字不改地作为消息原文。
+```
+
+### 新旧任务隔离
+
+**每次新任务前，先对两个 agent 发 `/new` 清空 Gateway session**，再发 `{(新任务)}`。确保 LLM 不混淆新旧任务。
+
+建议创建以下两个 skill 文件，`/new` 后自动加载：
+
+| Skill | 路径 | 内容 |
+|-------|------|------|
+| tether-protocol | `~/.hermes/skills/tether-protocol.md` | Tether 消息类型、tether_send 用法、relay 路径、中文昵称注意事项 |
+| collaboration-guide | `~/.hermes/skills/collaboration-guide.md` | 协作规范、handoff 接力、自证验证、{(完成)} 标记、飞书汇报 |
