@@ -86,6 +86,9 @@ def _get_sender_nick():
     return os.environ.get("TETHER_SENDER_NICK", LOCAL_HOSTNAME)
 
 
+MAX_WAKEUPS_PER_TASK = 3             # 每次任务最多发送带上下文的唤醒次数
+
+
 def _load_state():
     """加载持久化状态"""
     default = {
@@ -95,6 +98,7 @@ def _load_state():
         "conversation_was_active": False,
         "consecutive_stalls": 0,
         "current_task": "",          # v2: 上次检测到的 {(新任务)}...{(完)} 内容
+        "wakeup_count": 0,            # 当前任务已发送的唤醒次数（达到上限后清空 task）
     }
     if not os.path.isfile(STATE_FILE):
         return default
@@ -328,11 +332,13 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
     if new_task:
         log(f"📋 检测到新任务定义（{len(new_task)} chars）")
         state["current_task"] = new_task
+        state["wakeup_count"] = 0
 
     # v3: 检测 {(已完成)} 标记，清空 current_task
     if state.get("current_task") and _check_task_done(conn):
         log(f"📋 检测到 {(完成)} 标记，清空 current_task")
         state["current_task"] = ""
+        state["wakeup_count"] = 0
 
     # 1. 查询来自对端的最后一条消息
     last_msg = _get_last_peer_message(conn)
@@ -403,9 +409,18 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
         if cooldown_remaining > 0 and same_target:
             log(f"⏭ 跳过唤醒（冷却中，剩余 {cooldown_remaining:.0f} 秒）")
         else:
+            # 检查当前任务是否超过最大唤醒次数
+            if state.get("current_task") and state.get("wakeup_count", 0) >= MAX_WAKEUPS_PER_TASK:
+                log(f"🔔 当前任务已唤醒 {state['wakeup_count']} 次（上限 {MAX_WAKEUPS_PER_TASK}），清空 current_task")
+                state["current_task"] = ""
+                state["wakeup_count"] = 0
+
             ok = _send_wakeup(peer_host, state, stall_timeout)
             if ok:
                 state["last_wakeup_time"] = now
+                if state.get("current_task"):
+                    state["wakeup_count"] = state.get("wakeup_count", 0) + 1
+                    log(f"📊 当前任务已唤醒 {state['wakeup_count']}/{MAX_WAKEUPS_PER_TASK} 次")
                 state["last_wakeup_target"] = peer_host
 
         if state["consecutive_stalls"] >= 3:
