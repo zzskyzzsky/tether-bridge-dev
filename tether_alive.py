@@ -373,6 +373,9 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
                 state["last_wakeup_time"] = now
                 state["last_wakeup_target"] = peer_host
 
+        if state["consecutive_stalls"] >= 2 and state.get("current_task"):
+            log(f"🔔 连续 {state['consecutive_stalls']} 次唤醒无进展，清空 current_task")
+            state["current_task"] = ""
         if state["consecutive_stalls"] >= 3:
             log(f"🔔 连续 {state['consecutive_stalls']} 次检测到卡住（可配置主人通知）")
     elif is_stalled and not peer_host:
