@@ -239,3 +239,35 @@ systemctl --user restart tether-watcher.service
 |-------|------|------|
 | tether-protocol | `~/.hermes/skills/tether-protocol.md` | Tether 消息类型、tether_send 用法、relay 路径、中文昵称注意事项 |
 | collaboration-guide | `~/.hermes/skills/collaboration-guide.md` | 协作规范、handoff 接力、自证验证、{(已完成)} 标记、飞书汇报 |
+
+---
+
+## 部署更新
+
+新代码通过 GitHub 下发。两侧各自执行：
+
+```bash
+cd ~/.hermes/tether
+
+# 拉取最新代码
+git pull origin main
+
+# 重启改动的服务（根据改动类型选择）
+
+# 改了 tether_watcher.py
+systemctl --user restart tether-watcher.service
+
+# 改了 tether_alive.py（保活监控）
+systemctl --user restart tether-alive.service
+
+# 改了 tether_server.py
+systemctl --user restart tether.service
+
+# 改了网页文件（tether_web.py/html）
+systemctl --user restart tether-web.service
+```
+
+注意：
+- 每次 `/new` 后如果拉了新代码，重启对应服务
+- 不需要的服务不要重启
+- 如果不知道自己改了什么，全重启也不影响：`systemctl --user restart tether.service tether-watcher.service tether-alive.service tether-web.service`
