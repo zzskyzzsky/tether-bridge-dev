@@ -49,6 +49,20 @@ ACTIVITY_WINDOW_MINUTES = 20       # 在此窗口内有对话记录才算"活跃
 PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
 LOCAL_HOSTNAME = socket.gethostname()
 
+# 从 .env 读取飞书通知 webhook
+_NOTIFY_WEBHOOK_URL = ""
+_env_path = os.path.expanduser("~/.hermes/.env")
+if os.path.isfile(_env_path):
+    try:
+        with open(_env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("NOTIFY_WEBHOOK_URL="):
+                    _NOTIFY_WEBHOOK_URL = line.split("=", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+
 # 唤醒时包含的最近消息条数
 CONTEXT_MESSAGE_COUNT = 3
 
@@ -225,6 +239,35 @@ def _get_recent_context_messages(conn, since_iso, limit=CONTEXT_MESSAGE_COUNT):
         return [(r["sender"], r["msg"], r["received_at"], r["type"]) for r in rows]
     except sqlite3.Error:
         return []
+
+def _send_feishu_notification(task_preview, sender_host):
+    """通过飞书 webhook 发送通知到群"""
+    if not _NOTIFY_WEBHOOK_URL:
+        return
+    is_feishu = "feishu.cn" in _NOTIFY_WEBHOOK_URL.lower() or "larksuite" in _NOTIFY_WEBHOOK_URL.lower()
+    text = (
+        f"⚠️ Tether 任务已停止自动唤醒\n\n"
+        f"来源：{sender_host}\n"
+        f"任务摘要：{task_preview[:100]}\n"
+        f"已尝试唤醒 3 次均无进展，已清空任务上下文。\n"
+        f"请手动检查两端状态。"
+    )
+    if is_feishu:
+        payload = {"msg_type": "text", "content": {"text": text}}
+    else:
+        payload = {"msgtype": "text", "text": {"content": text}}
+    try:
+        req = urllib.request.Request(
+            _NOTIFY_WEBHOOK_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            _ = resp.read()
+        log("✅ 飞书通知发送成功")
+    except Exception as e:
+        log(f"⚠️ 飞书通知发送失败: {str(e)[:60]}")
+
 
 
 def _format_elapsed(seconds):
@@ -412,6 +455,9 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
             # 检查当前任务是否超过最大唤醒次数
             if state.get("current_task") and state.get("wakeup_count", 0) >= MAX_WAKEUPS_PER_TASK:
                 log(f"🔔 当前任务已唤醒 {state['wakeup_count']} 次（上限 {MAX_WAKEUPS_PER_TASK}），清空 current_task")
+                # 通知主人
+                task_preview = state.get("current_task", "")
+                _send_feishu_notification(task_preview, LOCAL_HOSTNAME)
                 state["current_task"] = ""
                 state["wakeup_count"] = 0
 
