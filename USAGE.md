@@ -207,7 +207,7 @@ systemctl --user restart tether-watcher.service
 
 ### 完成标记
 
-任务完成后，agent 在汇报消息中包含 `{(完成)}`。tether_alive 检测到后会自动清空 `current_task`，不再为已完成的任务发送唤醒。
+任务完成后，agent 在汇报消息中包含 `{(已完成)}`。tether_alive 检测到后会自动清空 `current_task`，不再为已完成的任务发送唤醒。
 
 ### 自证模式（推荐）
 
@@ -222,7 +222,7 @@ systemctl --user restart tether-watcher.service
 2. 执行这些命令
 3. 把实际输出贴出来
 
-汇报时在消息中包含 {(完成)}。然后 tp 在飞书 @我 汇报。
+汇报时在消息中包含 {(已完成)}。然后 tp 在飞书 @我 汇报。
 
 {(完)}
 
@@ -238,4 +238,4 @@ systemctl --user restart tether-watcher.service
 | Skill | 路径 | 内容 |
 |-------|------|------|
 | tether-protocol | `~/.hermes/skills/tether-protocol.md` | Tether 消息类型、tether_send 用法、relay 路径、中文昵称注意事项 |
-| collaboration-guide | `~/.hermes/skills/collaboration-guide.md` | 协作规范、handoff 接力、自证验证、{(完成)} 标记、飞书汇报 |
+| collaboration-guide | `~/.hermes/skills/collaboration-guide.md` | 协作规范、handoff 接力、自证验证、{(已完成)} 标记、飞书汇报 |

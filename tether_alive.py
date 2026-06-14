@@ -64,10 +64,10 @@ TASK_MARKER_PATTERN = _re.compile(
     _re.DOTALL
 )
 
-# {(完成)} 标记正则
+# {(已完成)} 标记正则
 DONE_MARKER_PATTERN = _re.compile(
     r'\{\('
-    r'完成'
+    r'已完成'
     r'\)\}'
 )
 
@@ -149,9 +149,9 @@ def _scan_new_task(conn):
 
 
 def _check_task_done(conn):
-    """扫描 messages + outgoing_messages 表，查找 {(完成)} 标记
+    """扫描 messages + outgoing_messages 表，查找 {(已完成)} 标记
 
-    任务完成时 agent 或主人可以发送包含 {(完成)} 的消息，
+    任务完成时 agent 或主人可以发送包含 {(已完成)} 的消息，
     tether_alive 检测到后清空 current_task，停止带任务上下文的唤醒。
     """
     try:
@@ -159,7 +159,7 @@ def _check_task_done(conn):
             time_col = "received_at" if table == "messages" else "sent_at"
             rows = conn.execute(
                 f"SELECT message FROM {table} "
-                f"WHERE message LIKE '%{{(完成)}}%' "
+                f"WHERE message LIKE '%{{(已完成)}}%' "
                 f"ORDER BY {time_col} DESC LIMIT 3"
             ).fetchall()
             for row in rows:
@@ -329,7 +329,7 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
         log(f"📋 检测到新任务定义（{len(new_task)} chars）")
         state["current_task"] = new_task
 
-    # v3: 检测 {(完成)} 标记，清空 current_task
+    # v3: 检测 {(已完成)} 标记，清空 current_task
     if state.get("current_task") and _check_task_done(conn):
         log(f"📋 检测到 {(完成)} 标记，清空 current_task")
         state["current_task"] = ""
