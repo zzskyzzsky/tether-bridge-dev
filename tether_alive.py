@@ -64,6 +64,13 @@ TASK_MARKER_PATTERN = _re.compile(
     _re.DOTALL
 )
 
+# {(完成)} 标记正则
+DONE_MARKER_PATTERN = _re.compile(
+    r'\{\('
+    r'完成'
+    r'\)\}'
+)
+
 
 def log(msg):
     print(f"[alive] {msg}", flush=True)
@@ -139,6 +146,29 @@ def _scan_new_task(conn):
         return ""
     except sqlite3.Error:
         return ""
+
+
+def _check_task_done(conn):
+    """扫描 messages + outgoing_messages 表，查找 {(完成)} 标记
+
+    任务完成时 agent 或主人可以发送包含 {(完成)} 的消息，
+    tether_alive 检测到后清空 current_task，停止带任务上下文的唤醒。
+    """
+    try:
+        for table in ("messages", "outgoing_messages"):
+            time_col = "received_at" if table == "messages" else "sent_at"
+            rows = conn.execute(
+                f"SELECT message FROM {table} "
+                f"WHERE message LIKE '%{{(完成)}}%' "
+                f"ORDER BY {time_col} DESC LIMIT 3"
+            ).fetchall()
+            for row in rows:
+                msg = row[0] if isinstance(row, tuple) else row["message"]
+                if DONE_MARKER_PATTERN.search(msg):
+                    return True
+        return False
+    except sqlite3.Error:
+        return False
 
 
 def _get_last_peer_message(conn):
@@ -299,6 +329,11 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
         log(f"📋 检测到新任务定义（{len(new_task)} chars）")
         state["current_task"] = new_task
 
+    # v3: 检测 {(完成)} 标记，清空 current_task
+    if state.get("current_task") and _check_task_done(conn):
+        log(f"📋 检测到 {(完成)} 标记，清空 current_task")
+        state["current_task"] = ""
+
     # 1. 查询来自对端的最后一条消息
     last_msg = _get_last_peer_message(conn)
     if last_msg is None:
@@ -373,9 +408,6 @@ def check_and_alert(state, stall_timeout=STALL_TIMEOUT_MINUTES,
                 state["last_wakeup_time"] = now
                 state["last_wakeup_target"] = peer_host
 
-        if state["consecutive_stalls"] >= 2 and state.get("current_task"):
-            log(f"🔔 连续 {state['consecutive_stalls']} 次唤醒无进展，清空 current_task")
-            state["current_task"] = ""
         if state["consecutive_stalls"] >= 3:
             log(f"🔔 连续 {state['consecutive_stalls']} 次检测到卡住（可配置主人通知）")
     elif is_stalled and not peer_host:
