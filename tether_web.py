@@ -67,6 +67,19 @@ def _route_str_full(from_name, to_name, via_relay):
         return f"{from_name} → relay → {to_name}"
     return f"{from_name} → {to_name}"
 
+def _direction(frm, to):
+    """判断消息方向：tp_to_mac / mac_to_tp / loop / relay / other"""
+    if frm == to or (frm == "?" and to == frm):
+        return "loop"
+    if frm == "relay" or to == "relay":
+        return "relay"
+    if frm == "tp" and to == "mac":
+        return "tp_to_mac"
+    if frm == "mac" and to == "tp":
+        return "mac_to_tp"
+    return "other"
+
+
 def _collect_messages(no_peer=False):
     results = []
     in_msgs = _query("SELECT id, sender, message, received_at AS time, type, acked FROM messages ORDER BY received_at ASC")
@@ -75,7 +88,7 @@ def _collect_messages(no_peer=False):
         to = LOCAL_NAME
         via_relay = frm == "relay"
         route = f"{PEER_NAME} → relay → {to}" if via_relay else _route_str_full(frm, to, False)
-        results.append({"id": m["id"], "dir": "in", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": m["type"] or "info", "message": m["message"], "source": "local"})
+        results.append({"id": m["id"], "dir": "in", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": m["type"] or "info", "message": m["message"], "source": "local", "direction": _direction(frm, to)})
 
     out_msgs = _query("SELECT id, target_host, sender, message, sent_at AS time, acked FROM outgoing_messages ORDER BY sent_at ASC")
     for m in out_msgs:
@@ -89,7 +102,7 @@ def _collect_messages(no_peer=False):
             to = _normalize_name(m["target_host"])
             route = _route_str_full(frm, to, False)
             via_relay = False
-        results.append({"id": m["id"], "dir": "out", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": "info", "message": m["message"], "source": "local"})
+        results.append({"id": m["id"], "dir": "out", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": "info", "message": m["message"], "source": "local", "direction": _direction(frm, to)})
 
     if PEER_WEB_URL and not no_peer:
         try:

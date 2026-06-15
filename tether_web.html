@@ -48,13 +48,16 @@ body {
 .msg-card.type-handoff { border-left: 3px solid var(--relay-color); }
 .msg-card.type-auto_reply { border-left: 3px solid var(--mac-color); }
 .msg-card.type-reply { border-left: 3px solid #d2a8ff; }
+/* 方向描边（优先级高于 type 描边） */
+.msg-card.dir-tp_to_mac { border-left-color: var(--tp-color) !important; }
+.msg-card.dir-mac_to_tp { border-left-color: #d29922 !important; }
 
 .msg-row {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  font-size: 13px;
+  font-size: 14px;
 }
-.msg-time { color: var(--text-muted); font-size: 12px; white-space: nowrap; font-family: monospace; }
-.msg-route { font-size: 13px; font-weight: 500; }
+.msg-time { color: var(--text-muted); font-size: 14px; font-weight: 600; white-space: nowrap; font-family: monospace; }
+.msg-route { font-size: 15px; font-weight: 600; }
 .msg-src-mac { color: var(--mac-color); }
 .msg-src-tp { color: var(--tp-color); }
 .msg-src-relay { color: var(--relay-color); }
@@ -163,16 +166,20 @@ function renderMessages(msgs) {
   const isNew = msgs.length !== prevCount;
   prevCount = msgs.length;
 
-  let html = '';
+  let html = '', count = 0;
   for (const m of msgs) {
+    // 跳过自回环消息
+    if (m.direction === 'loop') continue;
+    count++;
     const time = escapeHtml(m.time_bj || '');
     const routeHtml = colorRoute(escapeHtml(m.route || ''));
     const content = escapeHtml(m.message || '');
     const type = typeClass(m.type);
     const typeLabel = (m.type || 'info');
+    const dirClass = m.direction ? 'dir-' + m.direction : '';
 
     html += `
-      <div class="msg-card type-${type}">
+      <div class="msg-card type-${type} ${dirClass}">
         <div class="msg-row">
           <span class="msg-time">${time}</span>
           <span class="type-badge ${type}">${escapeHtml(typeLabel)}</span>
@@ -182,7 +189,7 @@ function renderMessages(msgs) {
       </div>`;
   }
   el.innerHTML = html;
-  document.getElementById('countLabel').textContent = msgs.length;
+  document.getElementById('countLabel').textContent = count;
 
   // Auto-scroll to bottom (newest messages)
   window.scrollTo({ top: document.body.scrollHeight, behavior: isNew ? 'smooth' : 'auto' });
