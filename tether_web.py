@@ -118,15 +118,18 @@ def _collect_messages(no_peer=False):
             local_keys = {(r["message"][:100], r["time"]) for r in results}
             for pm in peer_data.get("messages", []):
                 key = (pm["message"][:100], pm["time"])
-                if key not in local_keys:
-                    pm["source"] = "peer"
-                    results.append(pm)
+                # 跳过自回环和已存在的消息
+                if key in local_keys or pm.get("from") == pm.get("to"):
+                    continue
+                pm["source"] = "peer"
+                results.append(pm)
         except Exception:
             pass
 
-    # Sort DESC (newest first) so latest messages appear at top
-    results.sort(key=lambda x: x["time"] or "", reverse=True)
-    return results
+    # Sort ASC (oldest first) so latest messages appear at bottom
+    results.sort(key=lambda x: x["time"] or "")
+    # 只保留最新的 100 条
+    return results[-100:]
 
 @app.route("/")
 def index():

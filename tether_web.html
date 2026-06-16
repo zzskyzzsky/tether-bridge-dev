@@ -13,6 +13,7 @@
   --mac-color: #3fb950;
   --tp-color: #58a6ff;
   --relay-color: #d29922;
+  --yellow: #e3b341;
   --info-bg: rgba(88,166,255,0.12);   --info-border: rgba(88,166,255,0.3);
   --handoff-bg: rgba(210,153,34,0.15); --handoff-border: rgba(210,153,34,0.35);
   --reply-bg: rgba(63,185,80,0.12);   --reply-border: rgba(63,185,80,0.3);
@@ -33,6 +34,13 @@ body {
   display: flex; align-items: center; gap: 14px;
   font-size: 13px; color: var(--text-dim); flex-wrap: wrap;
 }
+.header-controls { display: flex; align-items: center; gap: 6px; }
+.header-controls input {
+  width: 50px; background: var(--card); border: 1px solid var(--border);
+  color: var(--text); padding: 3px 6px; border-radius: 4px;
+  font-size: 13px; text-align: center;
+}
+.header-controls label { font-size: 13px; color: var(--text-dim); }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
 .dot.online { background: var(--mac-color); }
 .dot.offline { background: #f85149; }
@@ -45,21 +53,21 @@ body {
 }
 .msg-card:hover { border-color: var(--text-muted); }
 .msg-card.dir-tp-to-mac { border-left: 3px solid var(--tp-color); }
-.msg-card.dir-mac-to-tp { border-left: 3px solid var(--relay-color); }
+.msg-card.dir-mac-to-tp { border-left: 3px solid var(--yellow); }
 .msg-card.dir-other { border-left: 3px solid var(--border); }
 
 .msg-row {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  font-size: 15px;
+  font-size: 16px;
 }
-.msg-time { color: var(--text-muted); font-size: 14px; white-space: nowrap; font-family: monospace; }
-.msg-route { font-size: 13px; font-weight: 500; }
+.msg-time { color: var(--text-muted); font-size: 15px; white-space: nowrap; font-family: monospace; font-weight: 500; }
+.msg-route { font-size: 15px; font-weight: 600; }
 .msg-src-mac { color: var(--mac-color); }
 .msg-src-tp { color: var(--tp-color); }
 .msg-src-relay { color: var(--relay-color); }
 .msg-arrow { color: var(--text-muted); }
 .type-badge {
-  font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 8px;
+  font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 8px;
   text-transform: uppercase; letter-spacing: 0.4px;
 }
 .type-badge.info { background: var(--info-bg); color: var(--accent); }
@@ -87,6 +95,10 @@ body {
     <span id="statusText">在线</span>
     <span id="countLabel">0</span>
     <span id="nextRefresh">10s</span>
+    <span class="header-controls">
+      <label for="intervalInput">刷新间隔(s):</label>
+      <input type="number" id="intervalInput" min="2" max="300" value="10">
+    </span>
     <span id="localLabel"></span>
   </div>
 </div>
@@ -96,9 +108,18 @@ body {
   </div>
 </div>
 <script>
-const POLL = 10000; // 10秒
-let isLoading = false, countdown = 10, localName = '';
+let isLoading = false, countdown = 10, localName = '', pollMs = 10000;
 let prevCount = 0;
+
+const intervalInput = document.getElementById('intervalInput');
+intervalInput.addEventListener('change', function() {
+  let val = parseInt(this.value) || 10;
+  if (val < 2) val = 2;
+  if (val > 300) val = 300;
+  this.value = val;
+  pollMs = val * 1000;
+  countdown = val;
+});
 
 function escapeHtml(t) {
   const d = document.createElement('div'); d.textContent = t; return d.innerHTML;
@@ -113,7 +134,6 @@ function srcClass(name) {
 }
 
 function colorRoute(route) {
-  // Segment-based: split by →, color each segment individually
   const segs = route.split('→');
   const colored = segs.map(function(s) {
     s = s.trim();
@@ -135,15 +155,17 @@ function typeClass(t) {
 
 function renderMessages(msgs) {
   const el = document.getElementById('msgList');
-  // msgs already sorted DESC (newest first) from backend
+  const isNew = msgs.length !== prevCount;
+  prevCount = msgs.length;
+
   if (!msgs || msgs.length === 0) {
     el.innerHTML = '<div class="empty">暂无消息</div>';
     document.getElementById('countLabel').textContent = '0';
     return;
   }
 
-  const isNew = msgs.length !== prevCount;
-  prevCount = msgs.length;
+  const scrollTarget = isNew ? el.lastElementChild : null;
+  const autoScroll = isNew && (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100);
 
   let html = '';
   for (const m of msgs) {
@@ -167,8 +189,10 @@ function renderMessages(msgs) {
   el.innerHTML = html;
   document.getElementById('countLabel').textContent = msgs.length;
 
-  // Auto-scroll to top (newest messages appear first in DESC order)
-  window.scrollTo({ top: 0, behavior: isNew ? 'smooth' : 'auto' });
+  // Auto-scroll to bottom (newest messages at bottom with ASC sort)
+  if (autoScroll || isNew) {
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  }
 }
 
 function setOnline(ok) {
@@ -205,7 +229,7 @@ function tick() {
   const el = document.getElementById('nextRefresh');
   if (countdown <= 0) {
     el.textContent = '0s';
-    countdown = 10;
+    countdown = Math.round(pollMs / 1000);
     fetchMessages();
   } else {
     el.textContent = countdown + 's';
