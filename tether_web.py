@@ -98,19 +98,22 @@ def _normalize_name(name):
     if not name:
         return "?"
     n = name.strip().lower()
-    if any(r in n for r in RELAY_NAMES):
+    # Relay
+    if any(r in n for r in RELAY_NAMES) or "vps" in n or "100.109.129" in n:
         return "relay"
-    if "zzsky-mbp" in n or "zzsky-mac" in n or "mac-弟弟" in n or "mac-小钉" in n or n == "mac":
+    # Mac
+    if any(x in n for x in ("zzsky-mbp", "zzsky-mac", "mac-弟弟", "mac-小钉")) or n in ("mac", "100.81.192.38"):
         return "mac"
-    if "zzskytpg3" in n or "zzskytpg" in n or "zzskytp" in n or "tp-哥哥" in n or "tp-小钉" in n or "tp-thinkpad" in n or n == "tp":
+    # TP
+    if any(x in n for x in ("zzskytpg3", "zzskytpg", "zzskytp", "tp-哥哥", "tp-小钉", "tp-thinkpad")) or n in ("tp", "100.102.54.90", "localhost", "127.0.0.1", "owner"):
         return "tp"
     if "tp" in n:
         return "tp"
-    if "100.81.192.38" in n:
-        return "mac"
-    if "100.102.54.90" in n:
-        return "tp"
-    return name[:15]
+    # Known unknowns
+    if n in ("unknown", "?", ""):
+        return "?"
+    # Fallback: return short safe label
+    return n[:8]
 
 def _route_str_full(from_name, to_name, via_relay):
     if via_relay:
@@ -167,7 +170,11 @@ def _collect_messages(no_peer=False):
                 if key in local_keys or pm.get("from") == pm.get("to"):
                     continue
                 pm["source"] = "peer"
-                pm["direction"] = _direction(pm.get("from", ""), pm.get("to", ""))
+                # 对 peer 消息重新 normalize（Mac 可能跑的旧代码）
+                pm["from"] = _normalize_name(pm.get("from", ""))
+                pm["to"] = _normalize_name(pm.get("to", ""))
+                pm["route"] = _route_str_full(pm["from"], pm["to"], pm.get("via_relay", False))
+                pm["direction"] = _direction(pm["from"], pm["to"])
                 results.append(pm)
         except Exception:
             pass
@@ -227,3 +234,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
