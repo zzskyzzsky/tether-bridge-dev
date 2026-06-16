@@ -1,9 +1,9 @@
 #!/home/zzsky/.hermes/tether/venv/bin/python3
-"""Tether Web v2 — 统一展示 Tether 消息（入站 + 出站 + 对端）
+"""Tether Web v3 — 统一展示 Tether 消息 + Tailscale 状态
 
-纯只读，不修改任何已有代码。读取 tether.db 直接展示。
+纯只读（除 /api/clear 外），不修改任何已有代码。
 """
-import json, os, socket, sqlite3, urllib.request
+import json, os, socket, sqlite3, subprocess, urllib.request
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, send_file
 
@@ -20,6 +20,46 @@ LOCAL_NAME = _HOST_MAP.get(HOSTNAME, HOSTNAME)
 PEER_NAME = "tp" if LOCAL_NAME == "mac" else "mac"
 RELAY_NAMES = {"relay", "154.8.143.218"}
 PEER_WEB_URL = os.environ.get("TETHER_WEB_PEER_URL", "")
+RELAY_HOST = "154.8.143.218"
+
+_TAILSCALE_PEERS_CACHE = None
+_TAILSCALE_CACHE_TIME = 0
+
+def _get_tailscale_status():
+    """获取 Tailscale 网络状态：各节点 IP、连接方式（直连/relay/DERP）"""
+    global _TAILSCALE_PEERS_CACHE, _TAILSCALE_CACHE_TIME
+    now = datetime.now().timestamp()
+    if _TAILSCALE_PEERS_CACHE and now - _TAILSCALE_CACHE_TIME < 15:
+        return _TAILSCALE_PEERS_CACHE
+    peers = {"tp": {"ip": "", "via": "unknown"}, "mac": {"ip": "", "via": "unknown"}, "vps": {"ip": "", "via": "unknown"}}
+    try:
+        result = subprocess.run(["tailscale", "status"], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ip = parts[0]
+            host = parts[1].lower()
+            extra = " ".join(parts[2:]) if len(parts) > 2 else ""
+            if "zzskytpg3" in host or host == "zzskytpg3":
+                peers["tp"]["ip"] = ip
+                peers["tp"]["via"] = "direct"
+            elif "zzsky-mbp" in host:
+                peers["mac"]["ip"] = ip
+                if "relay" in extra:
+                    import re
+                    m = re.search(r'relay\s+"([^"]+)"', extra)
+                    peers["mac"]["via"] = f'relay({m.group(1)})' if m else "relay"
+                else:
+                    peers["mac"]["via"] = "direct"
+            elif "vps" in host:
+                peers["vps"]["ip"] = ip
+                peers["vps"]["via"] = "direct"
+    except Exception:
+        pass
+    _TAILSCALE_PEERS_CACHE = peers
+    _TAILSCALE_CACHE_TIME = now
+    return peers
 
 def _query(sql, params=()):
     conn = sqlite3.connect(DB_PATH, timeout=3)
@@ -27,6 +67,18 @@ def _query(sql, params=()):
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def _query_one(sql, params=()):
+    conn = sqlite3.connect(DB_PATH, timeout=3)
+    row = conn.execute(sql, params).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def _execute(sql, params=()):
+    conn = sqlite3.connect(DB_PATH, timeout=3)
+    conn.execute(sql, params)
+    conn.commit()
+    conn.close()
 
 def _fmt_bj(iso_str):
     if not iso_str:
@@ -43,7 +95,6 @@ def _fmt_bj(iso_str):
         return iso_str[:17]
 
 def _normalize_name(name):
-    """将任意 sender/target 字符串归一化为 tp/mac/relay/unknown"""
     if not name:
         return "?"
     n = name.strip().lower()
@@ -55,7 +106,6 @@ def _normalize_name(name):
         return "tp"
     if "tp" in n:
         return "tp"
-    # Tailscale IPs
     if "100.81.192.38" in n:
         return "mac"
     if "100.102.54.90" in n:
@@ -68,8 +118,6 @@ def _route_str_full(from_name, to_name, via_relay):
     return f"{from_name} → {to_name}"
 
 def _direction(from_name, to_name):
-    """Determine message direction for border coloring.
-    Handles both direct (tp→mac, mac→tp) and relay (tp→relay, relay→tp) paths."""
     if from_name == "tp" and to_name in ("mac", "relay"):
         return "tp-to-mac"
     if from_name == "mac" and to_name in ("tp", "relay"):
@@ -86,7 +134,6 @@ def _collect_messages(no_peer=False):
     for m in in_msgs:
         frm = _normalize_name(m["sender"])
         to = LOCAL_NAME
-        # Skip self-loop messages (tp→tp, mac→mac)
         if frm == to:
             continue
         via_relay = frm == "relay"
@@ -105,7 +152,6 @@ def _collect_messages(no_peer=False):
             to = _normalize_name(m["target_host"])
             route = _route_str_full(frm, to, False)
             via_relay = False
-        # Skip self-loop messages (sent to self)
         if to == frm:
             continue
         results.append({"id": m["id"], "dir": "out", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": "info", "message": m["message"], "source": "local", "direction": _direction(frm, to)})
@@ -118,18 +164,16 @@ def _collect_messages(no_peer=False):
             local_keys = {(r["message"][:100], r["time"]) for r in results}
             for pm in peer_data.get("messages", []):
                 key = (pm["message"][:100], pm["time"])
-                # 跳过自回环和已存在的消息
                 if key in local_keys or pm.get("from") == pm.get("to"):
                     continue
                 pm["source"] = "peer"
+                pm["direction"] = _direction(pm.get("from", ""), pm.get("to", ""))
                 results.append(pm)
         except Exception:
             pass
 
-    # Sort ASC (oldest first) so latest messages appear at bottom
     results.sort(key=lambda x: x["time"] or "")
-    # 只保留最新的 100 条
-    return results[-100:]
+    return results
 
 @app.route("/")
 def index():
@@ -141,10 +185,32 @@ def index():
 def get_messages():
     no_peer = request.args.get("no_peer", "0") == "1"
     try:
-        msgs = _collect_messages(no_peer=no_peer)
-        return jsonify({"messages": msgs, "count": len(msgs), "hostname": HOSTNAME, "local_name": LOCAL_NAME})
+        all_msgs = _collect_messages(no_peer=no_peer)
+        total = len(all_msgs)
+        display = all_msgs[-100:]
+        return jsonify({"messages": display, "count": len(display), "total": total, "hostname": HOSTNAME, "local_name": LOCAL_NAME})
     except Exception as e:
         return jsonify({"error": str(e), "messages": []})
+
+@app.route("/api/status")
+def get_status():
+    ts = _get_tailscale_status()
+    data = {
+        "hostname": HOSTNAME,
+        "local_name": LOCAL_NAME,
+        "tailscale": ts,
+    }
+    return jsonify(data)
+
+@app.route("/api/clear", methods=["POST"])
+def clear_messages():
+    try:
+        _execute("DELETE FROM messages")
+        _execute("DELETE FROM outgoing_messages")
+        _execute("VACUUM")
+        return jsonify({"status": "ok", "message": "所有消息已清空"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/api/health")
 def health():
@@ -156,7 +222,7 @@ def health():
     return jsonify({"hostname": HOSTNAME, "local_name": LOCAL_NAME, "tether_web": "ok", "database": "ok" if db_ok else "error"})
 
 def main():
-    print(f"🌐 Tether Web v2 — http://0.0.0.0:{PORT}  (local={LOCAL_NAME})")
+    print(f"🌐 Tether Web v3 — http://0.0.0.0:{PORT}  (local={LOCAL_NAME})")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":

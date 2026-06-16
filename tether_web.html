@@ -26,24 +26,48 @@ body {
 .header {
   position: sticky; top: 0; z-index: 10;
   background: var(--bg); border-bottom: 1px solid var(--border);
-  padding: 12px 20px; display: flex; align-items: center;
-  justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  padding: 10px 20px;
 }
-.header h1 { font-size: 18px; font-weight: 600; }
-.header-info {
-  display: flex; align-items: center; gap: 14px;
-  font-size: 13px; color: var(--text-dim); flex-wrap: wrap;
+.header-top {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;
 }
+.header-info { display: flex; align-items: center; gap: 14px; font-size: 13px; color: var(--text-dim); flex-wrap: wrap; }
 .header-controls { display: flex; align-items: center; gap: 6px; }
 .header-controls input {
   width: 50px; background: var(--card); border: 1px solid var(--border);
-  color: var(--text); padding: 3px 6px; border-radius: 4px;
-  font-size: 13px; text-align: center;
+  color: var(--text); padding: 3px 6px; border-radius: 4px; font-size: 13px; text-align: center;
 }
 .header-controls label { font-size: 13px; color: var(--text-dim); }
+h1 { font-size: 18px; font-weight: 600; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
 .dot.online { background: var(--mac-color); }
 .dot.offline { background: #f85149; }
+.dot.relay-dot { background: var(--relay-color); }
+
+/* Tailscale 状态栏 */
+.ts-bar {
+  display: flex; align-items: center; gap: 16px; margin-top: 6px;
+  font-size: 12px; color: var(--text-dim); flex-wrap: wrap;
+}
+.ts-node {
+  display: flex; align-items: center; gap: 4px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 8px;
+}
+.ts-node .name { font-weight: 600; }
+.ts-node .ip { font-family: monospace; font-size: 11px; color: var(--text-muted); }
+.ts-node .via {
+  font-size: 11px; padding: 1px 5px; border-radius: 3px;
+}
+.ts-node .via.direct { background: rgba(63,185,80,0.15); color: var(--mac-color); }
+.ts-node .via.relay { background: rgba(210,153,34,0.15); color: var(--relay-color); }
+
+.btn-clear {
+  background: rgba(248,81,81,0.12); color: #f85149; border: 1px solid rgba(248,81,81,0.3);
+  padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.btn-clear:hover { background: rgba(248,81,81,0.25); }
+
 .container { max-width: 820px; margin: 0 auto; padding: 12px; }
 .msg-list { display: flex; flex-direction: column; gap: 4px; }
 .msg-card {
@@ -52,35 +76,43 @@ body {
   display: flex; flex-direction: column; gap: 4px;
 }
 .msg-card:hover { border-color: var(--text-muted); }
-.msg-card.dir-tp-to-mac { border-left: 3px solid var(--tp-color); }
-.msg-card.dir-mac-to-tp { border-left: 3px solid var(--yellow); }
-.msg-card.dir-other { border-left: 3px solid var(--border); }
+.msg-card.dir-tp-to-mac,
+.msg-card[class*="tp-to-mac"],
+.msg-card[class*="tp_to_mac"] { border-left: 3px solid var(--accent); }
+.msg-card.dir-mac-to-tp,
+.msg-card[class*="mac-to-tp"],
+.msg-card[class*="mac_to_tp"] { border-left: 3px solid var(--yellow); }
+.msg-card.dir-other,
+.msg-card[class*="relay"] { border-left: 3px solid var(--border); }
 
 .msg-row {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 8px;
   font-size: 16px;
 }
-.msg-time { color: var(--text-muted); font-size: 15px; white-space: nowrap; font-family: monospace; font-weight: 500; }
-.msg-route { font-size: 15px; font-weight: 600; }
-.msg-src-mac { color: var(--mac-color); }
-.msg-src-tp { color: var(--tp-color); }
-.msg-src-relay { color: var(--relay-color); }
-.msg-arrow { color: var(--text-muted); }
+.msg-time {
+  color: var(--text-muted); font-size: 15px; white-space: nowrap;
+  font-family: monospace; font-weight: 500;
+  min-width: 152px; display: inline-block;
+}
 .type-badge {
   font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 8px;
   text-transform: uppercase; letter-spacing: 0.4px;
+  min-width: 68px; text-align: center; display: inline-block;
 }
 .type-badge.info { background: var(--info-bg); color: var(--accent); }
 .type-badge.handoff { background: var(--handoff-bg); color: var(--relay-color); }
 .type-badge.auto_reply { background: var(--reply-bg); color: var(--mac-color); }
 .type-badge.reply { background: var(--reply-bg); color: #d2a8ff; }
+.msg-route { font-size: 15px; font-weight: 600; }
+.msg-src-mac { color: var(--mac-color); }
+.msg-src-tp { color: var(--tp-color); }
+.msg-src-relay { color: var(--relay-color); }
+.msg-arrow { color: var(--text-muted); }
 .msg-content {
   font-size: 14px; line-height: 1.5; word-break: break-word; white-space: pre-wrap;
   color: var(--text); padding-left: 0;
 }
-.empty {
-  text-align: center; color: var(--text-muted); padding: 60px 20px; font-size: 15px;
-}
+.empty { text-align: center; color: var(--text-muted); padding: 60px 20px; font-size: 15px; }
 .error { text-align: center; color: #f85149; padding: 40px 20px; font-size: 14px; }
 .loading { text-align: center; color: var(--text-muted); padding: 20px; font-size: 14px; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
@@ -89,17 +121,27 @@ body {
 </head>
 <body>
 <div class="header">
-  <h1>📡 Tether</h1>
-  <div class="header-info">
-    <span class="dot online" id="statusDot"></span>
-    <span id="statusText">在线</span>
-    <span id="countLabel">0</span>
-    <span id="nextRefresh">10s</span>
-    <span class="header-controls">
-      <label for="intervalInput">刷新间隔(s):</label>
-      <input type="number" id="intervalInput" min="2" max="300" value="10">
-    </span>
-    <span id="localLabel"></span>
+  <div class="header-top">
+    <h1>📡 Tether</h1>
+    <div class="header-info">
+      <span class="dot online" id="statusDot"></span>
+      <span id="statusText">在线</span>
+      <span id="countLabel">0</span>
+      <span>/</span>
+      <span id="totalLabel">0</span>
+      <span id="nextRefresh">10s</span>
+      <span class="header-controls">
+        <label for="intervalInput">刷新(s):</label>
+        <input type="number" id="intervalInput" min="2" max="300" value="10">
+      </span>
+      <button class="btn-clear" id="clearBtn">🗑 清空</button>
+      <span id="localLabel"></span>
+    </div>
+  </div>
+  <div class="ts-bar" id="tsBar">
+    <span class="ts-node" id="tsTp"><span class="name">tp</span> <span class="ip">-</span> <span class="via">-</span></span>
+    <span class="ts-node" id="tsMac"><span class="name">mac</span> <span class="ip">-</span> <span class="via">-</span></span>
+    <span class="ts-node" id="tsVps"><span class="name">vps</span> <span class="ip">-</span> <span class="via">-</span></span>
   </div>
 </div>
 <div class="container">
@@ -114,11 +156,26 @@ let prevCount = 0;
 const intervalInput = document.getElementById('intervalInput');
 intervalInput.addEventListener('change', function() {
   let val = parseInt(this.value) || 10;
-  if (val < 2) val = 2;
-  if (val > 300) val = 300;
+  if (val < 2) val = 2; if (val > 300) val = 300;
   this.value = val;
   pollMs = val * 1000;
   countdown = val;
+});
+
+document.getElementById('clearBtn').addEventListener('click', async function() {
+  if (!confirm('确定清空所有 Tether 消息？此操作不可撤销。')) return;
+  try {
+    const resp = await fetch('/api/clear', { method: 'POST' });
+    const data = await resp.json();
+    if (data.status === 'ok') {
+      fetchMessages();
+      fetchStatus();
+    } else {
+      alert('清空失败: ' + (data.message || ''));
+    }
+  } catch (e) {
+    alert('清空失败: ' + e.message);
+  }
 });
 
 function escapeHtml(t) {
@@ -153,10 +210,20 @@ function typeClass(t) {
   return '';
 }
 
+function typeLabel(t) {
+  const tt = (t || '').toLowerCase();
+  if (tt === 'info') return 'INFO';
+  if (tt === 'handoff') return 'HANDOFF';
+  if (tt === 'auto_reply') return 'REPLY';
+  if (tt === 'reply') return 'REPLY';
+  return (t || '').toUpperCase();
+}
+
 function renderMessages(msgs) {
   const el = document.getElementById('msgList');
   const isNew = msgs.length !== prevCount;
   prevCount = msgs.length;
+  const autoScroll = isNew && (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100);
 
   if (!msgs || msgs.length === 0) {
     el.innerHTML = '<div class="empty">暂无消息</div>';
@@ -164,23 +231,20 @@ function renderMessages(msgs) {
     return;
   }
 
-  const scrollTarget = isNew ? el.lastElementChild : null;
-  const autoScroll = isNew && (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100);
-
   let html = '';
   for (const m of msgs) {
     const time = escapeHtml(m.time_bj || '');
     const routeHtml = colorRoute(escapeHtml(m.route || ''));
     const content = escapeHtml(m.message || '');
     const type = typeClass(m.type);
-    const typeLabel = (m.type || 'info');
+    const tLabel = typeLabel(m.type);
     const dir = m.direction || 'other';
 
     html += `
       <div class="msg-card dir-${dir}">
         <div class="msg-row">
           <span class="msg-time">${time}</span>
-          <span class="type-badge ${type}">${escapeHtml(typeLabel)}</span>
+          <span class="type-badge ${type}">${tLabel}</span>
           <span class="msg-route">${routeHtml}</span>
         </div>
         <div class="msg-content">${content}</div>
@@ -189,17 +253,43 @@ function renderMessages(msgs) {
   el.innerHTML = html;
   document.getElementById('countLabel').textContent = msgs.length;
 
-  // Auto-scroll to bottom (newest messages at bottom with ASC sort)
   if (autoScroll || isNew) {
     window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
   }
 }
 
 function setOnline(ok) {
-  const dot = document.getElementById('statusDot');
-  const txt = document.getElementById('statusText');
-  dot.className = 'dot ' + (ok ? 'online' : 'offline');
-  txt.textContent = ok ? '在线' : '离线';
+  document.getElementById('statusDot').className = 'dot ' + (ok ? 'online' : 'offline');
+  document.getElementById('statusText').textContent = ok ? '在线' : '离线';
+}
+
+function renderStatus(data) {
+  if (!data || !data.tailscale) return;
+  const ts = data.tailscale;
+  for (const key of ['tp', 'mac', 'vps']) {
+    const node = ts[key];
+    if (!node) continue;
+    const el = document.getElementById('ts' + key.charAt(0).toUpperCase() + key.slice(1));
+    if (!el) continue;
+    const nameEl = el.querySelector('.name');
+    const ipEl = el.querySelector('.ip');
+    const viaEl = el.querySelector('.via');
+    if (nameEl) nameEl.textContent = key;
+    if (ipEl) ipEl.textContent = node.ip || '-';
+    if (viaEl) {
+      viaEl.textContent = node.via || '-';
+      viaEl.className = 'via ' + (node.via === 'direct' ? 'direct' : 'relay');
+    }
+  }
+}
+
+async function fetchStatus() {
+  try {
+    const resp = await fetch('/api/status');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderStatus(data);
+  } catch (e) { /* ignore */ }
 }
 
 async function fetchMessages() {
@@ -211,6 +301,7 @@ async function fetchMessages() {
     const data = await resp.json();
     if (data.error) { setOnline(false); return; }
     const msgs = data.messages || [];
+    document.getElementById('totalLabel').textContent = data.total || msgs.length;
     if (!localName && data.local_name) {
       localName = data.local_name;
       document.getElementById('localLabel').textContent = localName;
@@ -231,14 +322,15 @@ function tick() {
     el.textContent = '0s';
     countdown = Math.round(pollMs / 1000);
     fetchMessages();
+    fetchStatus();
   } else {
     el.textContent = countdown + 's';
     countdown--;
   }
 }
 
-// Start
 fetchMessages();
+fetchStatus();
 setInterval(tick, 1000);
 </script>
 </body>
