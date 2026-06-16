@@ -1003,6 +1003,15 @@ def _check_handoff_timeout():
         )
         _send_notification(notify_text)
 
+        # 通知后标记 acked=1，防止重复通知（通知一次就够）
+        try:
+            _conn = sqlite3.connect(db_path, timeout=3)
+            _conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (msg_id,))
+            _conn.commit()
+            _conn.close()
+        except Exception:
+            pass
+
 
 
 def _cleanup_old_messages():
