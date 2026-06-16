@@ -208,7 +208,7 @@ def _is_gateway_alive():
     """快速探测 Gateway 是否存活（HTTP /health 返回 200 才算活）"""
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{GATEWAY_PORT}/health")
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             return resp.status == 200
     except Exception:
         return False
