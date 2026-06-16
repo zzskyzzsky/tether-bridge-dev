@@ -67,18 +67,18 @@ def _route_str_full(from_name, to_name, via_relay):
         return f"{from_name} → relay → {to_name}"
     return f"{from_name} → {to_name}"
 
-def _direction(frm, to):
-    """判断消息方向：tp_to_mac / mac_to_tp / loop / relay / other"""
-    if frm == to or (frm == "?" and to == frm):
-        return "loop"
-    if frm == "relay" or to == "relay":
-        return "relay"
-    if frm == "tp" and to == "mac":
-        return "tp_to_mac"
-    if frm == "mac" and to == "tp":
-        return "mac_to_tp"
+def _direction(from_name, to_name):
+    """Determine message direction for border coloring.
+    Handles both direct (tp→mac, mac→tp) and relay (tp→relay, relay→tp) paths."""
+    if from_name == "tp" and to_name in ("mac", "relay"):
+        return "tp-to-mac"
+    if from_name == "mac" and to_name in ("tp", "relay"):
+        return "mac-to-tp"
+    if from_name == "relay" and to_name == "tp":
+        return "mac-to-tp"
+    if from_name == "relay" and to_name == "mac":
+        return "tp-to-mac"
     return "other"
-
 
 def _collect_messages(no_peer=False):
     results = []
@@ -86,6 +86,9 @@ def _collect_messages(no_peer=False):
     for m in in_msgs:
         frm = _normalize_name(m["sender"])
         to = LOCAL_NAME
+        # Skip self-loop messages (tp→tp, mac→mac)
+        if frm == to:
+            continue
         via_relay = frm == "relay"
         route = f"{PEER_NAME} → relay → {to}" if via_relay else _route_str_full(frm, to, False)
         results.append({"id": m["id"], "dir": "in", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": m["type"] or "info", "message": m["message"], "source": "local", "direction": _direction(frm, to)})
@@ -102,6 +105,9 @@ def _collect_messages(no_peer=False):
             to = _normalize_name(m["target_host"])
             route = _route_str_full(frm, to, False)
             via_relay = False
+        # Skip self-loop messages (sent to self)
+        if to == frm:
+            continue
         results.append({"id": m["id"], "dir": "out", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": "info", "message": m["message"], "source": "local", "direction": _direction(frm, to)})
 
     if PEER_WEB_URL and not no_peer:
@@ -118,7 +124,8 @@ def _collect_messages(no_peer=False):
         except Exception:
             pass
 
-    results.sort(key=lambda x: x["time"] or "")
+    # Sort DESC (newest first) so latest messages appear at top
+    results.sort(key=lambda x: x["time"] or "", reverse=True)
     return results
 
 @app.route("/")
