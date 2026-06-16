@@ -173,7 +173,8 @@ def _collect_messages(no_peer=False):
                 # 对 peer 消息重新 normalize（Mac 可能跑的旧代码）
                 pm["from"] = _normalize_name(pm.get("from", ""))
                 pm["to"] = _normalize_name(pm.get("to", ""))
-                pm["route"] = _route_str_full(pm["from"], pm["to"], pm.get("via_relay", False))
+                via_peer = pm.get("via_relay", False) and pm["from"] != "relay"
+                pm["route"] = _route_str_full(pm["from"], pm["to"], via_peer)
                 pm["direction"] = _direction(pm["from"], pm["to"])
                 results.append(pm)
         except Exception:
