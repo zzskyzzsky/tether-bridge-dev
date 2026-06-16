@@ -151,6 +151,44 @@ tether_send.py --help
 > **安全机制**：白名单参数解析——只认 `--host`/`--type`/`--port`/`--nick`，
 > 其余 `--xxx`（如 `--sender mac-弟弟`）静默跳过。防止 AI 误传多余参数吃掉消息内容。
 
+### tether-send-file — 传输文件/目录
+
+文件走 Tailscale P2P（scp/rsync），控制消息走 Tether。不经过 relay。
+
+```bash
+# 基本用法（发文件）
+tether_send_file local.txt ~/downloads/
+
+# 发目录
+tether_send_file ./my_project/ ~/backups/         # 内容 → ~/backups/
+tether_send_file ./my_project ~/backups/           # 目录本身 → ~/backups/my_project
+
+# 指定目标主机
+tether_send_file --host zzsky-mbp config.yaml ~/configs/
+
+# 启用 rsync（断点续传 + 进度显示）
+tether_send_file --rsync --progress ./big_dir/ ~/backups/
+
+# 启用 sha256 校验
+tether_send_file --strict --auto-receive secret.key ~/keys/
+
+# 收发双方确认模式
+tether_send_file --confirm sensitive.doc ~/docs/
+```
+
+**参数列表：**
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--host` | 目标主机名或 IP | `TETHER_PEER_HOST` |
+| `--rsync` | 用 rsync 替代 scp（断点续传） | scp |
+| `--strict` | 启用 sha256 校验 | 关 |
+| `--auto-receive` | 接收方 watcher 自动验收 | 关 |
+| `--confirm` | 收发双方确认后才传输 | 关 |
+| `--progress` | 显示传输进度 | 关 |
+
+> **前提**：两端已配置 SSH key 互信（Tailscale 网络通常已配置好）。
+
 ### tether-dump — 查看消息记录
 
 ```bash

@@ -30,6 +30,25 @@ tether_send --host zzskytpg3 --type info "消息内容"
 
 # 发送 handoff 消息（任务接力、代码 review）
 tether_send --host zzskytpg3 --type handoff "需要对方处理的任务"
+```
+
+### 传输文件/目录
+
+文件走 Tailscale P2P（scp/rsync），控制消息走 Tether。两端需 SSH key 互信。
+
+```bash
+# 发文件
+tether_send_file local.txt ~/downloads/
+
+# 发目录
+tether_send_file ./my_project/ ~/backups/
+
+# 指定主机
+tether_send_file --host zzsky-mbp config.yaml ~/configs/
+
+# rsync 模式（断点续传）
+tether_send_file --rsync --progress ./big_dir/ ~/backups/
+```
 
 # 覆盖昵称
 tether_send --host zzskytpg3 --nick mac-弟弟 --type info "消息"
