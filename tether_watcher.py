@@ -215,30 +215,40 @@ def _is_gateway_alive():
 
 
 def _ensure_gateway_alive():
-    """如果 Gateway 挂了，尝试自动重启 hermes-gateway.service
+    """如果 Gateway 挂了，先反复确认，再尝试重启
 
-    包含重启防抖：连续两次重启间隔至少 30 秒，防止无限重启循环。
+    重启防抖 30 秒。但在判定死亡前先做多次探测，
+    给 Gateway 自己恢复的机会（如飞书 WebSocket 重连期间的短暂无响应）。
     """
     global _last_restart_time
     now = time.time()
     if now - _last_restart_time < 30:
         return  # 防抖：30秒内不重复重启
-    _last_restart_time = now
 
+    # 第一次快速检查
     if _is_gateway_alive():
         return
 
-    log("⚠️ Gateway 不在线，尝试重启...")
+    # 慢速重试：给 Gateway 最多 ~25 秒自行恢复
+    log("⚠️ Gateway 暂未响应，持续监测中...")
+    for attempt in range(5):
+        time.sleep(5)
+        if _is_gateway_alive():
+            log(f"✅ Gateway 已自行恢复（第{attempt+1}次检查）")
+            return
+    log("⚠️ Gateway 连续 25 秒无响应，准备重启")
+
+    _last_restart_time = now
     try:
         subprocess.run(
             ["systemctl", "--user", "restart", "hermes-gateway.service"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=30
         )
     except Exception as e:
         log(f"❌ 重启命令失败: {e}")
         return
 
-    for attempt in range(6):
+    for attempt in range(12):
         if _is_gateway_alive():
             log(f"✅ Gateway 重启成功（第{attempt+1}次检查）")
             return
