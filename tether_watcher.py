@@ -668,6 +668,153 @@ def _auto_reply(output, sender_info, original_msg_id=None):
 
 
 
+# 文件传输去重缓存
+_FILE_XFER_CACHE = {}  # filename -> {retries, last_time}
+
+
+def _handle_file_transfer(content, sender, mid):
+    """处理 {(文件传输)} 控制消息，返回 True 表示已处理（跳过 Gateway）"""
+    if FILE_MARKER_START not in content:
+        return False
+
+    try:
+        meta = _parse_file_xfer(content)
+    except Exception:
+        return False
+
+    action = meta.get("action", "")
+    name = meta.get("name", "?")
+    log(f"📁 文件传输 [{mid}] action={action} name={name}")
+
+    if action == "confirm" and meta.get("auto_receive") == "true":
+        target = meta.get("target_path", "")
+        expected_size = int(meta.get("source_size", 0))
+        target_abs = os.path.expanduser(target)
+
+        if not os.path.exists(target_abs):
+            log(f"⚠️ 文件未到达: {target_abs}")
+            _file_xfer_respond(sender, "nack", name, reason="not_found")
+            return True
+
+        actual_size = 0
+        if os.path.isfile(target_abs):
+            actual_size = os.path.getsize(target_abs)
+        elif os.path.isdir(target_abs):
+            for dirpath, dirnames, filenames in os.walk(target_abs):
+                for f in filenames:
+                    try:
+                        actual_size += os.path.getsize(os.path.join(dirpath, f))
+                    except OSError:
+                        pass
+
+        if actual_size != expected_size:
+            log(f"⚠️ 大小不匹配: expected={expected_size} actual={actual_size}")
+            _file_xfer_respond(sender, "nack", name, reason="size_mismatch",
+                               detail=f"expected={expected_size} actual={actual_size}")
+            return True
+
+        # sha256 校验
+        sha256_expected = meta.get("sha256", "")
+        if sha256_expected and os.path.isfile(target_abs):
+            computed = _file_sha256(target_abs)
+            if computed != sha256_expected:
+                log(f"⚠️ sha256 不匹配")
+                _file_xfer_respond(sender, "nack", name, reason="sha256_mismatch",
+                                   computed_sha256=computed)
+                return True
+
+        log(f"✅ 文件验收通过: {name} ({actual_size} bytes)")
+        _file_xfer_respond(sender, "ack", name)
+        return True
+
+    if action == "ack":
+        log(f"✅ 对方已确认收到: {name}")
+        return True
+
+    if action == "nack":
+        reason = meta.get("reason", "unknown")
+        log(f"⚠️ 对方拒收: {name} reason={reason}")
+        # 自动重试逻辑在 tether_send_file 中处理
+        return True
+
+    return False  # 非文件传输消息或未知 action，交回正常流程
+
+
+def _parse_file_xfer(content):
+    """从 {(文件传输)}...{(完)} 中解析键值对"""
+    meta = {}
+    start = content.find(FILE_MARKER_START)
+    end = content.find(FILE_MARKER_END)
+    if start < 0 or end < 0:
+        return meta
+    body = content[start + len(FILE_MARKER_START):end].strip()
+    for line in body.split("\n"):
+        line = line.strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            meta[k.strip()] = v.strip()
+    return meta
+
+
+def _file_sha256(path):
+    """计算文件 sha256"""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _file_xfer_respond(sender, action, name, reason="", detail="", computed_sha256=""):
+    """发送文件传输确认消息回发送方"""
+    hostname = __import__("socket").gethostname()
+    nick = os.environ.get("TETHER_SENDER_NICK", hostname)
+
+    lines = [FILE_MARKER_START, f"action={action}", f"name={name}"]
+    if reason:
+        lines.append(f"reason={reason}")
+    if detail:
+        lines.append(f"detail={detail}")
+    if computed_sha256:
+        lines.append(f"computed_sha256={computed_sha256}")
+    lines.append(FILE_MARKER_END)
+    msg = "\n".join(lines)
+
+    # 从 sender 提取目标主机
+    target_host = sender.split()[0] if sender else ""
+    if not target_host or target_host in ("unknown",):
+        target_host = os.environ.get("TETHER_PEER_HOST", "")
+    if not target_host:
+        log("⚠️ 无法确定回复目标")
+        return
+
+    payload = json.dumps({
+        "from": f"{hostname} ({nick})",
+        "sender": f"{hostname} ({nick})",
+        "message": msg,
+        "content": msg,
+        "type": "info",
+    }).encode()
+
+    peer_url = f"http://{target_host}:{PEER_PORT}/message"
+    try:
+        req = urllib.request.Request(peer_url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        log(f"📤 文件传输确认 已发送 → {target_host}  msg_id={result.get('message_id','?')[:8]}")
+    except Exception as e:
+        log(f"⚠️ 文件传输确认发送失败: {str(e)[:60]}")
+
+
+FILE_MARKER_START = "{(文件传输)}"
+FILE_MARKER_END = "{(完)}"
+
+
 def process_messages():
     """从 Tether 拉取未处理消息并逐一处理。返回本次处理的消息数。
 
@@ -724,6 +871,10 @@ def process_messages():
                             "5分钟没收到对端新消息"]
             if any(kw in content for kw in skip_keywords):
                 log(f"\u23ed {mid} 跳过（确认循环消息）")
+                continue
+
+            # 文件传输控制消息：直接处理，不走 Gateway
+            if _handle_file_transfer(content, sender, mid):
                 continue
 
             prompt = (
