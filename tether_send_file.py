@@ -12,7 +12,7 @@ Tether File Send — 通过 scp/rsync + Tether 控制消息传输文件/目录
 import argparse, hashlib, json, os, socket, subprocess, sys, time, urllib.request
 from datetime import datetime, timezone
 
-TETHER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
+TETHER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9003"))
 RELAY_HOST = os.environ.get("TETHER_PEER_HOST", "")
 LOCAL_HOSTNAME = socket.gethostname()
 SENDER_NICK = os.environ.get("TETHER_SENDER_NICK", LOCAL_HOSTNAME)

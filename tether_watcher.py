@@ -683,6 +683,9 @@ def _handle_file_transfer(content, sender, mid):
         return False
 
     action = meta.get("action", "")
+    if not action:
+        return False  # 没有 action 字段，不是有效的文件传输控制消息
+
     name = meta.get("name", "?")
     log(f"📁 文件传输 [{mid}] action={action} name={name}")
 
