@@ -871,7 +871,12 @@ def process_messages():
             # 去重过滤：连续确认循环消息直接跳过（同 sender、含确认关键词、N 分钟内重复）
             skip_keywords = ["已清理", "无积压", "无需操作", "不回复以阻断", "等主人回来",
                             "不回复以阻断循环", "双方一致", "已对齐", "已确认",
-                            "5分钟没收到对端新消息"]
+                            "5分钟没收到对端新消息",
+                            "[任务重启]", "检测到对话卡住了", "请检查目前的进度并继续推进",
+                            "如果任务已完成请忽略此消息", "[呼叫-保活]", "文件传输",
+                            "Tether 文件传输设计", "信令与数据分离",
+                            "auto-ack分析", "auto-ack 分析", "fire-and-forget",
+                            "讨论以下tether文件传输", "VPS relay 端口"]
             if any(kw in content for kw in skip_keywords):
                 log(f"\u23ed {mid} 跳过（确认循环消息）")
                 continue
