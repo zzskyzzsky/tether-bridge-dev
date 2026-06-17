@@ -170,11 +170,15 @@ def _collect_messages(no_peer=False):
                 if key in local_keys or pm.get("from") == pm.get("to"):
                     continue
                 pm["source"] = "peer"
-                # 对 peer 消息重新 normalize（Mac 可能跑的旧代码）
                 pm["from"] = _normalize_name(pm.get("from", ""))
                 pm["to"] = _normalize_name(pm.get("to", ""))
-                via_peer = pm.get("via_relay", False) and pm["from"] != "relay"
-                pm["route"] = _route_str_full(pm["from"], pm["to"], via_peer)
+                # peer 消息 from=relay 说明原发端是对端
+                if pm["from"] == "relay" and pm["to"] != "relay":
+                    pm["route"] = f"{LOCAL_NAME} → relay → {pm['to']}"
+                    pm["from"] = LOCAL_NAME
+                else:
+                    via_peer = pm.get("via_relay", False) and pm["to"] != "relay"
+                    pm["route"] = _route_str_full(pm["from"], pm["to"], via_peer)
                 pm["direction"] = _direction(pm["from"], pm["to"])
                 results.append(pm)
         except Exception:
@@ -216,6 +220,13 @@ def clear_messages():
         _execute("DELETE FROM messages")
         _execute("DELETE FROM outgoing_messages")
         _execute("VACUUM")
+        # 同时清空对端
+        if PEER_WEB_URL:
+            try:
+                req = urllib.request.Request(f"{PEER_WEB_URL}/api/clear", method="POST")
+                urllib.request.urlopen(req, timeout=10)
+            except Exception:
+                pass
         return jsonify({"status": "ok", "message": "所有消息已清空"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
