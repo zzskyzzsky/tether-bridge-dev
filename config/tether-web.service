@@ -1,0 +1,15 @@
+[Unit]
+Description=Tether Web — 消息网页展示
+After=network-online.target
+Wants=tether.service
+
+[Service]
+Type=simple
+ExecStart=/home/zzsky/.hermes/tether/tether_web.py --port 9002
+WorkingDirectory=/home/zzsky/.hermes/tether
+Environment=TETHER_WEB_PEER_URL=http://zzsky-mbp:9002
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
