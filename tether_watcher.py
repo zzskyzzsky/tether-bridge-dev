@@ -120,6 +120,23 @@ DINGTALK_LOG_ONLY = False  # 正式通知，真实 POST 到钉钉群
 if not NOTIFY_WEBHOOK_URL and DINGTALK_WEBHOOK_URL:
     NOTIFY_WEBHOOK_URL = DINGTALK_WEBHOOK_URL
 
+# 出站噪音治理（见 _auto_reply）：占位符 / 纯确认文本一律不转发
+# ⚠️ 必须按内容判定 —— DEDUP_SECONDS 只拦"30 秒内相同内容"，
+# 挡不住间隔 >30s 的周期性纯确认语（mac 侧实测 10 条、tp 侧 12 条占位符）
+_AUTO_REPLY_PLACEHOLDERS = {
+    "（不产生任何输出）", "(不产生任何输出)",
+    "[SKIP]", "NO_REPLY", "[NO_REPLY]",
+    "（无输出）", "(无输出)", "NO OUTPUT",
+}
+_AUTO_REPLY_PLACEHOLDER_KEYS = ("不产生任何输出", "[SKIP]", "NO_REPLY", "无输出")
+# 纯确认短语：仅当"整条输出即全部内容"时才丢弃（不做包含匹配，
+# 否则会误杀"确认收到，另外我发现 X"这类带信息的回复）
+_AUTO_REPLY_CONFIRMATIONS = {
+    "确认", "确认。", "确认！", "收到", "收到。",
+    "确认，standby。", "确认，standby", "静默待命。", "静默待命",
+    "确认，无新动作。", "确认，无新动作", "已确认。", "已确认",
+}
+
 # 超时唤醒去重缓存
 _HANDOFF_TIMEOUT_CACHE = {}  # outgoing_msg_id -> timestamp
 _HANDOFF_TIMEOUT_MINUTES = 15  # 默认15分钟（之前5分钟，通知太频繁）
@@ -395,8 +412,37 @@ def _should_report(output):
     return False
 
 
+def _notify_dedup_skip(content):
+    """通知去重：30 秒内相同内容判定为重复，返回 True 表示应跳过。
+
+    ⚠️ 这段逻辑原先只挂在 _send_dingtalk 内部（钉钉专用路径）。汇报出口改用
+    通用 _send_notification 后必须一并迁移 —— 否则同一份报告会重复发给主人
+    （mac 侧 review 指出的漏洞）。
+    """
+    try:
+        content_hash = __import__("hashlib").md5(content.encode()).hexdigest()
+    except Exception:
+        return False
+    now = time.time()
+    if content_hash in _DINGTALK_DEDUP_CACHE:
+        if now - _DINGTALK_DEDUP_CACHE[content_hash] < _DINGTALK_DEDUP_SECS:
+            log(f"⏭️ 跳过重复通知（{_DINGTALK_DEDUP_SECS}秒内相同内容 {content_hash[:8]}）")
+            return True
+    _DINGTALK_DEDUP_CACHE[content_hash] = now
+    # 定期清理过期缓存（最多保留 100 条）
+    if len(_DINGTALK_DEDUP_CACHE) > 100:
+        cutoff = now - _DINGTALK_DEDUP_SECS
+        for k, v in list(_DINGTALK_DEDUP_CACHE.items()):
+            if v < cutoff:
+                del _DINGTALK_DEDUP_CACHE[k]
+    return False
+
+
 def _send_dingtalk(content):
     """通过 DingTalk 群机器人 webhook 发送消息
+
+    ⚠️ 已废弃：汇报出口现统一走 _send_notification（支持飞书/钉钉自动识别，
+    且同样带 dedup）。本函数保留仅为兼容历史调用，请勿在新代码中使用。
 
     读取 DINGTALK_WEBHOOK_URL，POST markdown 消息到钉钉群。
     支持 dedup（30秒内同内容不重复发）和 log-only 测试模式。
@@ -470,6 +516,11 @@ def _send_notification(content):
         _write_report_to_file(content)
         return
 
+    # Dedup：30秒内相同内容不重复发（从 _send_dingtalk 迁移，见 _notify_dedup_skip）
+    if _notify_dedup_skip(content):
+        _write_report_to_file(content)
+        return
+
     # 判断 webhook 类型
     is_feishu = "feishu.cn" in NOTIFY_WEBHOOK_URL.lower() or "larksuite" in NOTIFY_WEBHOOK_URL.lower()
     is_dingtalk = "dingtalk" in NOTIFY_WEBHOOK_URL.lower()
@@ -477,18 +528,18 @@ def _send_notification(content):
     if is_feishu:
         payload = {
             "msg_type": "text",
-            "content": {"text": f"🤖 Tether 报告\n\n{content[:3000]}"},
+            "content": {"text": f"🤖 Tether 报告\n\n{content[:8000]}"},
         }
     elif is_dingtalk:
         payload = {
             "msgtype": "text",
-            "text": {"content": f"🤖 Tether 报告\n\n{content[:3000]}"},
+            "text": {"content": f"🤖 Tether 报告\n\n{content[:8000]}"},
         }
     else:
         # 无法识别类型，尝试飞书格式
         payload = {
             "msg_type": "text",
-            "content": {"text": f"🤖 Tether 报告\n\n{content[:3000]}"},
+            "content": {"text": f"🤖 Tether 报告\n\n{content[:8000]}"},
         }
 
     try:
@@ -549,6 +600,20 @@ def _auto_reply(output, sender_info, original_msg_id=None):
     - 只在首次失败时尝试 fallback，成功即停止
     """
     if not output or not sender_info:
+        return
+
+    # ⚠️ 出站噪音治理（按内容判定，早于 [:4000] 切片与 DB 去重查询）
+    # 背景：agent 说"不说话"时输出「（不产生任何输出）」，被当消息发出去；
+    # 纯确认语（"确认，standby。"）也会周期性外发 —— 两端各 10~12 条实测。
+    _stripped = output.strip()
+    if not _stripped:
+        log("⏭️ auto-reply 跳过：输出为空/纯空白")
+        return
+    if _stripped in _AUTO_REPLY_PLACEHOLDERS or _stripped in _AUTO_REPLY_CONFIRMATIONS:
+        log(f"⏭️ auto-reply 跳过：占位符/纯确认文本（{_stripped[:20]}）")
+        return
+    if len(_stripped) <= 24 and any(k in _stripped for k in _AUTO_REPLY_PLACEHOLDER_KEYS):
+        log(f"⏭️ auto-reply 跳过：占位符变体（{_stripped[:20]}）")
         return
 
     # 从 sender_info 中提取主机名（格式: "hostname (nickname)"）
@@ -914,7 +979,10 @@ def process_messages():
             if output and sender:
                 if _should_report(output):
                     log(f"🔔 {mid} 标记为 Report → 走通知")
-                    _send_dingtalk(output)
+                    # ⚠️ 必须走 _send_notification（自动识别飞书/钉钉）；旧的
+                    # _send_dingtalk 只认 DINGTALK_WEBHOOK_URL，未配置则静默落盘
+                    # → 主人收不到汇报（本次修复的主项）
+                    _send_notification(output)
 
                 # is_reply 消息跳过 auto-reply，防止回环
                 # 对端 watcher 已处理过，我们 Gateway 收到上下文即可继续推进
@@ -1020,6 +1088,9 @@ def process_handoffs():
         f"1) 分析消息内容并执行必要的操作（修改文件、重启服务等）\n"
         f"2) 处理完成后输出总结\n"
         f"3) 如果这是需要汇报给主人的最终报告，请在第一行写上 [REPORT]\n"
+        f"4) ⚠️ 若无实质内容需要传达，请直接输出空文本——不要写"
+        f"「确认」「收到」「standby」「静默待命」这类纯确认语，它们会被当成噪音"
+        f"消息转发给对方。\n"
     )
 
     # 子线程调用 Gateway API，不阻塞主循环
@@ -1035,14 +1106,22 @@ def process_handoffs():
         except Exception as e:
             log(f"❌ Handoff 异常: {str(e)[:80]}")
 
-        # Handoff 处理结果：Report 走通知，所有消息都 auto-reply 回发送方
+        # Handoff 处理结果：Report 走通知，其余 auto-reply 回发送方
         if output and sender:
-            if _should_report(output):
+            is_report = _should_report(output)
+            if is_report:
                 log(f"🔔 Handoff [{msg_id[:8]}] 标记为 Report → 走通知")
-                _send_dingtalk(output)
+                # 同 :948 分支，必须走 _send_notification 才认飞书 hook
+                _send_notification(output)
 
-            # 所有消息都 auto-reply 回发送方
-            _auto_reply(output, sender, msg_id)
+            # ⚠️ 已判为 Report 的不再 auto-reply（tp 侧）：那份文本是给主人的汇报，
+            # 无条件转发会给对端灌入大段主人向内容（mac 实测收到 29 条"主人，…"
+            # 开头的错发）。本次 handoff 仍回一条简短 ack 保持链路闭合。
+            if is_report:
+                _auto_reply(f"✅ 已处理 handoff #{msg_id[:8]}，报告已发主人。", sender, msg_id)
+            else:
+                # 所有消息都 auto-reply 回发送方
+                _auto_reply(output, sender, msg_id)
 
         # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
         _ack_handoff(msg_id)
