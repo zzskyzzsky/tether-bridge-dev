@@ -24,7 +24,7 @@ POLL_INTERVAL = 2
 
 # 同行 Tether 地址（对方 Hermes 实例，用于自动回复）
 PEER_HOST = os.environ.get("TETHER_PEER_HOST", "")
-PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
+PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9003"))
 PEER_FALLBACK_HOST = os.environ.get("TETHER_PEER_FALLBACK_HOST", "")
 TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
@@ -32,6 +32,7 @@ TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 _HOST_TO_NICK_SHORT = {
     "zzsky-mbp": "mac",
     "zzskytpg3": "tp",
+    "100.102.54.90": "tp",  # TP Tailscale IP
     "154.8.143.218": "tp",   # VPS relay -> tp
 }
 
@@ -551,14 +552,16 @@ def _auto_reply(output, sender_info, original_msg_id=None):
     if not output or not sender_info:
         return
 
-    # 从 sender_info 中提取主机名（格式: "hostname (nickname)"）
-    target_host = sender_info.split()[0] if sender_info else ""
+    # 优先使用 TETHER_PEER_HOST（IP 优先，hostname 可能 DNS 解析失败）
+    # 2026-09-01 修复：此前优先从 sender_info 提取主机名，但 mac 的 Tailscale
+    # 解析不了 zzskytpg3，导致 auto-reply 全部 DNS 失败。改为环境变量优先。
+    target_host = os.environ.get("TETHER_PEER_HOST", "").strip()
     if not target_host or target_host in ("unknown",):
-        # 无法从 sender 提取主机名时，回退到 PEER_HOST 环境变量
-        target_host = os.environ.get("TETHER_PEER_HOST", "")
-        if not target_host:
-            log("⚠️ TETHER_PEER_HOST 未设置且 sender 无主机名 → auto-reply 跳过，请设置 TETHER_PEER_HOST=对方主机名")
-            return
+        # 环境变量未设置时，从 sender 提取主机名兜底
+        target_host = sender_info.split()[0] if sender_info else ""
+    if not target_host or target_host in ("unknown",):
+        log("⚠️ TETHER_PEER_HOST 未设置且 sender 无主机名 → auto-reply 跳过，请设置 TETHER_PEER_HOST=对方主机名")
+        return
 
     # 检查 target_host 是否含非 ASCII 字符（如纯中文昵称），有则回退到 PEER_HOST
     if any(ord(c) > 127 for c in target_host):
