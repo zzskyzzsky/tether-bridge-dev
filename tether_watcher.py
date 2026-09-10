@@ -124,18 +124,40 @@ if not NOTIFY_WEBHOOK_URL and DINGTALK_WEBHOOK_URL:
 # ⚠️ 必须按内容判定 —— DEDUP_SECONDS 只拦"30 秒内相同内容"，
 # 挡不住间隔 >30s 的周期性纯确认语（mac 侧实测 10 条、tp 侧 12 条占位符）
 _AUTO_REPLY_PLACEHOLDERS = {
-    "（不产生任何输出）", "(不产生任何输出)",
+    "（不产生任何输出）", "(不产生任何输出)", "不产生任何输出",
     "[SKIP]", "NO_REPLY", "[NO_REPLY]",
-    "（无输出）", "(无输出)", "NO OUTPUT",
+    "（无输出）", "(无输出)", "无输出", "NO OUTPUT",
 }
-_AUTO_REPLY_PLACEHOLDER_KEYS = ("不产生任何输出", "[SKIP]", "NO_REPLY", "无输出")
-# 纯确认短语：仅当"整条输出即全部内容"时才丢弃（不做包含匹配，
-# 否则会误杀"确认收到，另外我发现 X"这类带信息的回复）
+# 纯确认短语（精确匹配；配合 _NOISE_WRAP 归一化，可吸收尾随句号/包裹括号）
 _AUTO_REPLY_CONFIRMATIONS = {
-    "确认", "确认。", "确认！", "收到", "收到。",
+    "确认", "确认。", "确认！", "收到", "收到。", "好的", "好的。",
     "确认，standby。", "确认，standby", "静默待命。", "静默待命",
     "确认，无新动作。", "确认，无新动作", "已确认。", "已确认",
 }
+# 归一化时从两端剥离的包裹符/句末标点（用于吸收「（不产生任何输出）\n」「NO_REPLY。」）
+_NOISE_WRAP = "（）()【】[]{}<>《》「」。.！!？?,，、；;:：·… \t\r\n"
+
+
+def _is_noise_output(text):
+    """判断 agent 输出是否为「零信息噪音」（占位符 / 纯确认语）。
+
+    ⚠️ 绝不用裸子串匹配：实测「检查完成，日志无输出异常」「NO_REPLY 机制我已理解，
+    结论如下」都会被裸子串规则误杀（已加回归测试）。这里改为：
+      1) 原文精确匹配
+      2) 剥掉两端包裹符后精确匹配
+      3) 仅对辨识度极高的「不产生任何输出」额外放宽为"整串只是它 + 包裹符"
+    """
+    s = (text or "").strip()
+    if not s:
+        return True
+    if s in _AUTO_REPLY_PLACEHOLDERS or s in _AUTO_REPLY_CONFIRMATIONS:
+        return True
+    core = s.strip(_NOISE_WRAP).strip()
+    if core and (core in _AUTO_REPLY_PLACEHOLDERS or core in _AUTO_REPLY_CONFIRMATIONS):
+        return True
+    if "不产生任何输出" in core and len(core) <= len("不产生任何输出") + 4:
+        return True
+    return False
 
 # 超时唤醒去重缓存
 _HANDOFF_TIMEOUT_CACHE = {}  # outgoing_msg_id -> timestamp
@@ -605,15 +627,8 @@ def _auto_reply(output, sender_info, original_msg_id=None):
     # ⚠️ 出站噪音治理（按内容判定，早于 [:4000] 切片与 DB 去重查询）
     # 背景：agent 说"不说话"时输出「（不产生任何输出）」，被当消息发出去；
     # 纯确认语（"确认，standby。"）也会周期性外发 —— 两端各 10~12 条实测。
-    _stripped = output.strip()
-    if not _stripped:
-        log("⏭️ auto-reply 跳过：输出为空/纯空白")
-        return
-    if _stripped in _AUTO_REPLY_PLACEHOLDERS or _stripped in _AUTO_REPLY_CONFIRMATIONS:
-        log(f"⏭️ auto-reply 跳过：占位符/纯确认文本（{_stripped[:20]}）")
-        return
-    if len(_stripped) <= 24 and any(k in _stripped for k in _AUTO_REPLY_PLACEHOLDER_KEYS):
-        log(f"⏭️ auto-reply 跳过：占位符变体（{_stripped[:20]}）")
+    if _is_noise_output(output):
+        log(f"⏭️ auto-reply 跳过：占位符/纯确认文本（{output.strip()[:20]!r}）")
         return
 
     # 从 sender_info 中提取主机名（格式: "hostname (nickname)"）
