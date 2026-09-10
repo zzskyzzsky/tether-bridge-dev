@@ -122,7 +122,9 @@ def receive():
                 json.dump({
                     "msg_id": msg_id,
                     "sender": sender,
-                    "summary": content[:200],
+                    # ⚠️ 必须写全文：watcher 把该字段当作 prompt 全文使用（不是真的摘要）。
+                    # 历史上这里写的是 content[:200]，导致长 handoff 后文被静默丢弃。
+                    "summary": content,
                     "timestamp": _now(),
                 }, f)
         except Exception:

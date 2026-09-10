@@ -33,7 +33,7 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 SENDER_NAME = socket.gethostname()
 SENDER_NICK = os.environ.get("TETHER_SENDER_NICK", "tp-小钉hermes")
 ENV_HOST_KEY = "TETHER_PEER_HOST"
-DEFAULT_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
+DEFAULT_PORT = int(os.environ.get("TETHER_PEER_PORT", "9003"))
 DEFAULT_TYPE = "info"
 VALID_TYPES = {"info", "handoff"}
 
@@ -47,7 +47,7 @@ def print_usage():
     print("选项:", file=sys.stderr)
     print("  --help              显示此帮助", file=sys.stderr)
     print("  --host, -h <主机>   目标主机（Tailscale 主机名/IP/URL，也支持 http://host:port）", file=sys.stderr)
-    print("  --port, -p <端口>   目标端口（默认 9001）", file=sys.stderr)
+    print("  --port, -p <端口>   目标端口（默认 9003）", file=sys.stderr)
     print("  --type, -t <类型>   消息类型: info（默认）| handoff", file=sys.stderr)
     print("  --nick <昵称>       发送方昵称（覆盖环境变量 TETHER_SENDER_NICK）", file=sys.stderr)
     print("  --peer <主机>       目标主机（--host 的别名，与 relay 脚本一致）", file=sys.stderr)

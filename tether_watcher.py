@@ -24,7 +24,7 @@ POLL_INTERVAL = 2
 
 # 同行 Tether 地址（对方 Hermes 实例，用于自动回复）
 PEER_HOST = os.environ.get("TETHER_PEER_HOST", "")
-PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9001"))
+PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9003"))
 PEER_FALLBACK_HOST = os.environ.get("TETHER_PEER_FALLBACK_HOST", "")
 TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
@@ -876,7 +876,14 @@ def process_messages():
                             "如果任务已完成请忽略此消息", "[呼叫-保活]", "文件传输",
                             "Tether 文件传输设计", "信令与数据分离",
                             "auto-ack分析", "auto-ack 分析", "fire-and-forget",
-                            "讨论以下tether文件传输", "VPS relay 端口"]
+                            "讨论以下tether文件传输", "VPS relay 端口",
+                            "已闭环", "彻底切断", "好。停了", "不再响应",
+                            "一切干净", "以后 relay 来的消息",
+                            "当前状态一切干净", "tether/web/watcher 全部 active",
+                            "[文件传输]", "tether_test", "test_hello",
+                            "scp 测试", "文件传输测试", "tether_test2",
+                            "tether_test4", "完整清单已在本会话中",
+                            "完整 50 条已分批发至", "50 个方向·完整清单"]
             if any(kw in content for kw in skip_keywords):
                 log(f"\u23ed {mid} 跳过（确认循环消息）")
                 continue
@@ -934,6 +941,32 @@ def _write_handoff_result(sender, summary, output):
         pass
 
 
+def _fetch_message_text(msg_id):
+    """按 msg_id 从 messages 表取回消息全文。
+
+    用途：handoff 文件里的 summary 字段被 server 端按 content[:200] 截断写入，
+    但它在 watcher 中是被当作 prompt 全文使用的 —— 需要回查 DB 还原完整内容。
+    （sqlite3 在本模块是函数内局部导入，切勿在模块顶部 import。）
+    """
+    if not msg_id:
+        return ""
+    try:
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        if not os.path.isfile(db_path):
+            return ""
+        conn = sqlite3.connect(db_path, timeout=3)
+        try:
+            row = conn.execute("SELECT message FROM messages WHERE id=?", (msg_id,)).fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception as e:
+        log(f"handoff 全文回查异常: {str(e)[:60]}")
+    return ""
+
+
 def process_handoffs():
     """检查 handoff 文件，有内容就通过 Gateway API 处理
 
@@ -952,6 +985,17 @@ def process_handoffs():
 
     sender = handoff.get("sender", "")
     summary = handoff.get("summary", "")
+    msg_id = handoff.get("msg_id", "")
+
+    # ⚠️ 全文回查必须在下面的判空守卫之前：summary 字段实际被当作 prompt 全文使用
+    # （见下方 prompt 构造），而 server 端历史上按 content[:200] 截断写入 handoff 文件，
+    # 导致超长 handoff 的后文被静默丢弃、agent 根本看不到。
+    # 用 msg_id 从 messages 表取回全文；取不到（旧格式无 msg_id / 消息已清理）时保留原语义。
+    if msg_id:
+        full_text = _fetch_message_text(msg_id)
+        if full_text:
+            summary = full_text
+
     if not sender or not summary:
         # 空 handoff 文件，删掉避免重复 stat
         try:
@@ -977,8 +1021,6 @@ def process_handoffs():
         f"2) 处理完成后输出总结\n"
         f"3) 如果这是需要汇报给主人的最终报告，请在第一行写上 [REPORT]\n"
     )
-
-    msg_id = handoff.get("msg_id", "")
 
     # 子线程调用 Gateway API，不阻塞主循环
     def _run_handoff(sender=sender, msg_id=msg_id):
@@ -1250,7 +1292,7 @@ def _recover_next_handoff():
             json.dump({
                 "msg_id": msg_id,
                 "sender": sender,
-                "summary": message[:200],
+                "summary": message,
                 "timestamp": __import__("datetime").datetime.now().isoformat(),
             }, f)
     except Exception as e:
@@ -1278,7 +1320,7 @@ def _recover_stale_handoffs():
                 json.dump({
                     "msg_id": msg_id,
                     "sender": sender,
-                    "summary": message[:200],
+                    "summary": message,
                     "timestamp": __import__("datetime").datetime.now().isoformat(),
                 }, f)
             # 只恢复第一条，后续靠子线程链式推进
