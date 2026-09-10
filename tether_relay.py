@@ -34,13 +34,13 @@ HOSTNAME = socket.gethostname()
 LISTEN_PORT = int(os.environ.get("RELAY_PORT", "9003"))
 
 # TP 的 Tether Server（mac 发来的消息要转发给 TP）
-RELAY_TP = os.environ.get("RELAY_TP", "http://100.102.54.90:9001")
+RELAY_TP = os.environ.get("RELAY_TP", "http://100.102.54.90:9003")
 # mac 的 Tether Server（TP 发来的消息要转发给 mac）
-RELAY_MAC = os.environ.get("RELAY_MAC", "http://100.81.192.38:9001")
+RELAY_MAC = os.environ.get("RELAY_MAC", "http://100.81.192.38:9003")
 
 # 中继使用的 sender 标识 — 必须是 IP 或域名，让 watcher 能 POST 到对端
 RELAY_SENDER = os.environ.get("RELAY_SENDER", "154.8.143.218 (relay)")
-RELAY_PEER = os.environ.get("RELAY_PEER", "http://100.81.192.38:9001")
+RELAY_PEER = os.environ.get("RELAY_PEER", "http://100.81.192.38:9003")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether_relay.db")
 NOTIFY_FILE = "/tmp/tether_relay_notify.json"
@@ -263,8 +263,9 @@ def health_loop():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5)
-            peer_host = RELAY_PEER.replace("http://", "").replace("https://", "").split(":")[0]
-            peer_port = 9001
+            _peer = RELAY_PEER.replace("http://", "").replace("https://", "")
+            peer_host = _peer.split(":")[0]
+            peer_port = int(_peer.split(":")[1]) if ":" in _peer else 9003
             s.connect((peer_host, peer_port))
             status = "connected"
             s.close()

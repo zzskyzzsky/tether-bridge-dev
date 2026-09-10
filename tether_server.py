@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 HOSTNAME = socket.gethostname()
-LISTEN_PORT = 9001
+LISTEN_PORT = 9003
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
@@ -122,7 +122,9 @@ def receive():
                 json.dump({
                     "msg_id": msg_id,
                     "sender": sender,
-                    "summary": content[:200],
+                    # ⚠️ 必须写全文：watcher 把该字段当作 prompt 全文使用（不是真的摘要）。
+                    # 历史上这里写的是 content[:200]，导致长 handoff 后文被静默丢弃。
+                    "summary": content,
                     "timestamp": _now(),
                 }, f)
         except Exception:
