@@ -32,6 +32,7 @@ TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 _HOST_TO_NICK_SHORT = {
     "zzsky-mbp": "mac",
     "zzskytpg3": "tp",
+    "100.102.54.90": "tp",  # TP Tailscale IP
     "154.8.143.218": "tp",   # VPS relay -> tp
 }
 
@@ -523,6 +524,42 @@ def _send_dingtalk(content):
     _write_report_to_file(content)
 
 
+# ===== 长报告分片（2026-09-10）=====
+# 背景：原实现用 content[:3000] / [:8000] 静默截断 → 主人收到的长汇报尾部被砍。
+# 改为按片发送：优先在换行处切分，单行过长时硬切；超过 _NOTIFY_MAX_CHUNKS 片时
+# 在末片明确标注省略量（避免无上限刷屏，且不再"静默"丢内容）。
+_NOTIFY_CHUNK_SIZE = 8000
+_NOTIFY_MAX_CHUNKS = 4
+
+
+def _split_message_chunks(text, size=_NOTIFY_CHUNK_SIZE, max_chunks=_NOTIFY_MAX_CHUNKS):
+    """把长文本切成每片 <= size 字的若干片（优先按行切分）。"""
+    if not text:
+        return [""]
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > size:                      # 单行过长 → 硬切
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(line[:size])
+            line = line[size:]
+        if cur and len(cur) + len(line) + 1 > size:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    if not parts:
+        parts = [text[:size]]
+    if len(parts) > max_chunks:
+        dropped = sum(len(p) for p in parts[max_chunks:])
+        parts = parts[:max_chunks]
+        parts[-1] += f"\n…（正文过长，已省略后续 {dropped} 字；完整内容见报告文件）"
+    return parts
+
+
 def _send_notification(content):
     """通过 Webhook 发送通知（支持飞书 + 钉钉）
 
@@ -547,38 +584,36 @@ def _send_notification(content):
     is_feishu = "feishu.cn" in NOTIFY_WEBHOOK_URL.lower() or "larksuite" in NOTIFY_WEBHOOK_URL.lower()
     is_dingtalk = "dingtalk" in NOTIFY_WEBHOOK_URL.lower()
 
-    if is_feishu:
-        payload = {
-            "msg_type": "text",
-            "content": {"text": f"🤖 Tether 报告\n\n{content[:8000]}"},
-        }
-    elif is_dingtalk:
-        payload = {
-            "msgtype": "text",
-            "text": {"content": f"🤖 Tether 报告\n\n{content[:8000]}"},
-        }
-    else:
-        # 无法识别类型，尝试飞书格式
-        payload = {
-            "msg_type": "text",
-            "content": {"text": f"🤖 Tether 报告\n\n{content[:8000]}"},
-        }
-
-    try:
-        req = urllib.request.Request(
-            NOTIFY_WEBHOOK_URL,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
-        if result.get("StatusCode") == 0 or result.get("errcode") == 0:
-            log("✅ 通知发送成功")
+    # 长报告分片发送（2026-09-10）：不再静默截断到 8000 字，按片全量送达。
+    chunks = _split_message_chunks(content, _NOTIFY_CHUNK_SIZE, _NOTIFY_MAX_CHUNKS)
+    total = len(chunks)
+    ok_cnt = 0
+    for idx, chunk in enumerate(chunks, 1):
+        head = "🤖 Tether 报告" + (f"（{idx}/{total}）" if total > 1 else "")
+        text = f"{head}\n\n{chunk}"
+        if is_dingtalk:
+            payload = {"msgtype": "text", "text": {"content": text}}
         else:
-            log(f"⚠️ 通知返回错误: {str(result)[:80]}")
-    except Exception as e:
-        log(f"❌ 通知 POST 失败: {str(e)[:60]}")
+            # 飞书（含无法识别 webhook 时的兜底格式）
+            payload = {"msg_type": "text", "content": {"text": text}}
+        try:
+            req = urllib.request.Request(
+                NOTIFY_WEBHOOK_URL,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+            if result.get("StatusCode") == 0 or result.get("errcode") == 0 or result.get("code") == 0:
+                ok_cnt += 1
+                log(f"✅ 通知发送成功（{idx}/{total}，{len(chunk)} 字）")
+            else:
+                log(f"⚠️ 通知返回错误: {str(result)[:80]}")
+        except Exception as e:
+            log(f"❌ 通知 POST 失败: {str(e)[:60]}")
+    if total > 1:
+        log(f"📨 长报告分 {total} 片发送，成功 {ok_cnt} 片")
     _write_report_to_file(content)
 
 
@@ -607,6 +642,54 @@ def _try_post(peer_url, payload, timeout=10):
         return False, str(e)[:100]
 
 
+# ===== 入站噪音判定（2026-09-10 收紧；mac review 实证误杀）=====
+# ① 整条即纯确认语 → 跳过
+# ② 话题级噪音词用包含匹配，但仅当消息 ≤ _SKIP_CONTAINS_MAX_LEN 字 → 跳过
+# ③ 例外：疑似故障报告（含失败/报错/超时等）一律放行，不进跳过逻辑
+# 实证背景：1543 / 1377 字的实质技术更正因正文出现"已闭环"被整条静默丢弃；
+#          "不再响应" 属故障报告高频词（"服务不再响应"），不可无条件跳过。
+_SKIP_EXACT_CONFIRMATIONS = {
+    "已闭环", "彻底切断", "好。停了", "不再响应", "一切干净",
+    "当前状态一切干净", "tether/web/watcher 全部 active",
+    "以后 relay 来的消息", "双方一致", "已对齐", "已确认",
+}
+_SKIP_INCIDENT_WORDS = ("失败", "错误", "报错", "崩溃", "宕机", "超时", "异常",
+                        "不再响应", "无响应", "没有响应", "未响应", "无法访问",
+                        "连接失败", "502", "500", "error", "fail", "Error", "Fail")
+# ⚠️ 表内只放"话题级噪音"，不放"纯确认语"——后者由 _SKIP_EXACT_CONFIRMATIONS 精确匹配，
+#    否则"服务不再响应"这类故障通报会被包含匹配误杀（2026-09-10 单测实证）。
+_SKIP_CONTAINS_KEYWORDS = [
+    "已清理", "无积压", "无需操作", "不回复以阻断", "等主人回来",
+    "不回复以阻断循环",
+    "5分钟没收到对端新消息",
+    "[任务重启]", "检测到对话卡住了", "请检查目前的进度并继续推进",
+    "如果任务已完成请忽略此消息", "[呼叫-保活]", "文件传输",
+    "Tether 文件传输设计", "信令与数据分离",
+    "auto-ack分析", "auto-ack 分析", "fire-and-forget",
+    "讨论以下tether文件传输", "VPS relay 端口",
+    "[文件传输]", "tether_test", "test_hello",
+    "scp 测试", "文件传输测试", "tether_test2",
+    "tether_test4", "完整清单已在本会话中",
+    "完整 50 条已分批发至", "50 个方向·完整清单",
+]
+_SKIP_CONTAINS_MAX_LEN = 400
+
+
+def _is_skip_noise(content):
+    """入站噪音判定：True = 跳过（不进 Gateway，省 API 费用）。"""
+    if not content:
+        return False
+    c = content.strip()
+    if not c:
+        return False
+    # 疑似故障报告一律放行（宁可多花一次调用，也不能吞掉故障通报）
+    if any(w in c for w in _SKIP_INCIDENT_WORDS):
+        return False
+    if c in _SKIP_EXACT_CONFIRMATIONS:
+        return True
+    return len(c) <= _SKIP_CONTAINS_MAX_LEN and any(k in c for k in _SKIP_CONTAINS_KEYWORDS)
+
+
 def _auto_reply(output, sender_info, original_msg_id=None):
     """自动回复：将 hermes -z / Gateway 的输出 POST 回发送方 Tether
 
@@ -631,14 +714,17 @@ def _auto_reply(output, sender_info, original_msg_id=None):
         log(f"⏭️ auto-reply 跳过：占位符/纯确认文本（{output.strip()[:20]!r}）")
         return
 
-    # 从 sender_info 中提取主机名（格式: "hostname (nickname)"）
-    target_host = sender_info.split()[0] if sender_info else ""
+    # 目标主机：优先 TETHER_PEER_HOST（IP 直连，不依赖短名解析）
+    # 2026-09-01 修复保留（当时 mac 解析不了 zzskytpg3 → auto-reply 全部 DNS 失败）。
+    # 2026-09-10 MagicDNS 短名已修好（Clash hosts + ts.net 解析策略），但 IP 直连更稳，
+    # 仍以环境变量优先；未设置时回退 sender_info 主机名（见下方兜底分支）。
+    target_host = os.environ.get("TETHER_PEER_HOST", "").strip()
     if not target_host or target_host in ("unknown",):
-        # 无法从 sender 提取主机名时，回退到 PEER_HOST 环境变量
-        target_host = os.environ.get("TETHER_PEER_HOST", "")
-        if not target_host:
-            log("⚠️ TETHER_PEER_HOST 未设置且 sender 无主机名 → auto-reply 跳过，请设置 TETHER_PEER_HOST=对方主机名")
-            return
+        # 环境变量未设置时，从 sender 提取主机名兜底
+        target_host = sender_info.split()[0] if sender_info else ""
+    if not target_host or target_host in ("unknown",):
+        log("⚠️ TETHER_PEER_HOST 未设置且 sender 无主机名 → auto-reply 跳过，请设置 TETHER_PEER_HOST=对方主机名")
+        return
 
     # 检查 target_host 是否含非 ASCII 字符（如纯中文昵称），有则回退到 PEER_HOST
     if any(ord(c) > 127 for c in target_host):
@@ -948,24 +1034,9 @@ def process_messages():
                 msg["ttl"] = 1
                 log(f"\u26a1 {mid} 首次经过，设置 TTL=1")
 
-            # 去重过滤：连续确认循环消息直接跳过（同 sender、含确认关键词、N 分钟内重复）
-            skip_keywords = ["已清理", "无积压", "无需操作", "不回复以阻断", "等主人回来",
-                            "不回复以阻断循环", "双方一致", "已对齐", "已确认",
-                            "5分钟没收到对端新消息",
-                            "[任务重启]", "检测到对话卡住了", "请检查目前的进度并继续推进",
-                            "如果任务已完成请忽略此消息", "[呼叫-保活]", "文件传输",
-                            "Tether 文件传输设计", "信令与数据分离",
-                            "auto-ack分析", "auto-ack 分析", "fire-and-forget",
-                            "讨论以下tether文件传输", "VPS relay 端口",
-                            "已闭环", "彻底切断", "好。停了", "不再响应",
-                            "一切干净", "以后 relay 来的消息",
-                            "当前状态一切干净", "tether/web/watcher 全部 active",
-                            "[文件传输]", "tether_test", "test_hello",
-                            "scp 测试", "文件传输测试", "tether_test2",
-                            "tether_test4", "完整清单已在本会话中",
-                            "完整 50 条已分批发至", "50 个方向·完整清单"]
-            if any(kw in content for kw in skip_keywords):
-                log(f"\u23ed {mid} 跳过（确认循环消息）")
+            # 入站噪音判定（判定逻辑抽到模块级 _is_skip_noise，便于单测）
+            if _is_skip_noise(content):
+                log(f"\u23ed {mid} 跳过（确认循环/纯噪音消息）")
                 continue
 
             # 文件传输控制消息：直接处理，不走 Gateway
@@ -1129,10 +1200,12 @@ def process_handoffs():
                 # 同 :948 分支，必须走 _send_notification 才认飞书 hook
                 _send_notification(output)
 
-            # ⚠️ 已判为 Report 的不再 auto-reply（tp 侧）：那份文本是给主人的汇报，
-            # 无条件转发会给对端灌入大段主人向内容（mac 实测收到 29 条"主人，…"
-            # 开头的错发）。本次 handoff 仍回一条简短 ack 保持链路闭合。
-            if is_report:
+            # ⚠️ 替换为短 ack 的条件必须收窄到**显式 [REPORT] 前缀**（2026-09-10 review）。
+            # handoff 的 prompt 明确要求"给主人的最终报告"首行写 [REPORT]；而
+            # _should_report 的关键词（如"测试通过"）会被对端的分析回复误命中
+            # → 对端只收到"已处理"、丢掉实质结论 = 链路断（尤其 mac 是接收方时）。
+            # 非显式标记 → 仍发全文，保证闭环；报告类内容也不会外泄给对端。
+            if output.startswith("[REPORT]"):
                 _auto_reply(f"✅ 已处理 handoff #{msg_id[:8]}，报告已发主人。", sender, msg_id)
             else:
                 # 所有消息都 auto-reply 回发送方

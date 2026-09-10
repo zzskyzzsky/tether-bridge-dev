@@ -31,7 +31,7 @@ from urllib.request import Request, urlopen
 app = Flask(__name__)
 
 HOSTNAME = socket.gethostname()
-LISTEN_PORT = int(os.environ.get("RELAY_PORT", "9001"))
+LISTEN_PORT = int(os.environ.get("RELAY_PORT", "9003"))
 
 # TP 的 Tether Server（mac 发来的消息要转发给 TP）
 RELAY_TP = os.environ.get("RELAY_TP", "http://100.102.54.90:9003")

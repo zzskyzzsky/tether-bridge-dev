@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 HOSTNAME = socket.gethostname()
-LISTEN_PORT = 9001
+LISTEN_PORT = 9003
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
