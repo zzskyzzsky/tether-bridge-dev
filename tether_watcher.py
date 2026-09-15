@@ -78,6 +78,22 @@ def _get_peer_nick():
     # fallback：从环境变量获取
     return os.environ.get("TETHER_PEER_NICK", "对方")
 
+
+def _local_nick():
+    """本机短名（tp/mac）——所有推送/通知的消息头部必须标出发送方角色
+
+    主人 2026-09-15 要求：pusher-bot 推给他的消息头部必须明确写 tp 或 mac，
+    否则两端来回推送时他分不清是哪台机器发的。
+    """
+    host = __import__("socket").gethostname()
+    n = _get_nick(host)
+    if n and n != host:
+        return n
+    sn = os.environ.get("TETHER_SENDER_NICK", "")
+    if sn:
+        return sn.split("-")[0]
+    return "unknown"
+
 # 从环境变量或 ~/.hermes/.env 读取 Gateway API Key + DingTalk Webhook URL
 API_KEY_ENV = os.environ.get("API_SERVER_KEY", "")
 GATEWAY_API_KEY = API_KEY_ENV.strip() if API_KEY_ENV else ""
@@ -496,8 +512,8 @@ def _send_dingtalk(content):
     payload = {
         "msgtype": "markdown",
         "markdown": {
-            "title": "🤖 Tether 报告",
-            "text": f"🤖 **Tether 报告**\n\n{content[:4000]}",
+            "title": f"[{_local_nick()}] 🤖 Tether 报告",
+            "text": f"[{_local_nick()}] 🤖 **Tether 报告**\n\n{content[:4000]}",
         },
     }
 
@@ -589,7 +605,7 @@ def _send_notification(content):
     total = len(chunks)
     ok_cnt = 0
     for idx, chunk in enumerate(chunks, 1):
-        head = "🤖 Tether 报告" + (f"（{idx}/{total}）" if total > 1 else "")
+        head = f"[{_local_nick()}] 🤖 Tether 报告" + (f"（{idx}/{total}）" if total > 1 else "")
         text = f"{head}\n\n{chunk}"
         if is_dingtalk:
             payload = {"msgtype": "text", "text": {"content": text}}

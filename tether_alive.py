@@ -240,13 +240,23 @@ def _get_recent_context_messages(conn, since_iso, limit=CONTEXT_MESSAGE_COUNT):
     except sqlite3.Error:
         return []
 
+def _role_tag():
+    """本机角色标签（tp/mac）——推送头部必须标明发送方（主人 2026-09-15 要求）"""
+    h = socket.gethostname().lower()
+    if "tpg" in h or "thinkpad" in h:
+        return "tp"
+    if "mbp" in h or "mac" in h:
+        return "mac"
+    return os.environ.get("TETHER_ROLE_TAG", "unknown")
+
+
 def _send_feishu_notification(task_preview, sender_host):
     """通过飞书 webhook 发送通知到群"""
     if not _NOTIFY_WEBHOOK_URL:
         return
     is_feishu = "feishu.cn" in _NOTIFY_WEBHOOK_URL.lower() or "larksuite" in _NOTIFY_WEBHOOK_URL.lower()
     text = (
-        f"⚠️ Tether 任务已停止自动唤醒\n\n"
+        f"[{_role_tag()}] ⚠️ Tether 任务已停止自动唤醒\n\n"
         f"来源：{sender_host}\n"
         f"任务摘要：{task_preview[:100]}\n"
         f"已尝试唤醒 3 次均无进展，已清空任务上下文。\n"
