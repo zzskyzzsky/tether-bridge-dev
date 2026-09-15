@@ -4,6 +4,13 @@ Title: [Bug] Title generation fails with 400 on OpenAI-compatible endpoints that
 Status: archived evidence - NOT filed upstream (decision 2026-09-15 by project owner). Retained for future
 reference; the sections below are issue-ready should that decision be revisited.
 
+Decision provenance (kept with this archive so it does not depend on memory):
+- Owner instruction, relayed verbatim via the Feishu line at 2026-09-15 19:58:43: "第一个修改，第二个本地绕开@mac-飞书hermes 同时告诉tp"
+  (the immediately preceding DM at 19:50:15 read "你跟tp商量，告诉我结论").
+- The wording "不用报上游" was a RELAY PARAPHRASE, not a verbatim quote: it has no verbatim match in the
+  receiving machine's inbound log. Its meaning matches "第一个修改" (fix locally rather than file upstream).
+- Outcome: this document is archived evidence; nothing was filed upstream.
+
 ## Summary
 After upgrading 0.20.0 -> 0.21.3 (tag v2026.9.14), auxiliary title generation fails on every new session:
 
