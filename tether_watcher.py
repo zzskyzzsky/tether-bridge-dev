@@ -257,7 +257,93 @@ def _tether_healthy():
 
 
 GATEWAY_PORT = 8642
-_last_restart_time = 0  # 重启防抖计时（同时用于 Gateway 和 Tether 的自愈）
+
+# ── 网关重启加固（2026-09-16 主人批准）────────────────────────
+# 背景：0.20.0→0.21.3 升级后 venv 缺 extras（aiohttp 等）→ api_server 起不来 →
+# health 永不为 200 → 本防抖逻辑每 ~90s 重启一次网关 → 网关启动时自跑的
+# `uv pip install --compile-bytecode`（补缺失依赖）被反复打断 → 依赖永远装不完，
+# 3 小时重启 20 次。三条闸门专门堵这个环：
+#   ① 依赖安装进程在跑 → 一律不重启（等它装完）
+#   ② 防抖 30 秒 → 10 分钟（避免把启动中的网关判死）
+#   ③ 滚动 1 小时最多 3 次；达到上限即要求间隔翻倍（600s→1200s），
+#      再超限指数退避（2400s…）至 30 分钟封顶 + 重启前落现场
+GATEWAY_RESTART_DEBOUNCE = 600        # 秒；防抖窗口
+GATEWAY_RESTART_MAX_PER_HOUR = 3      # 滚动 1 小时重启次数上限
+GATEWAY_RESTART_BACKOFF_BASE = 600    # 退避基数（秒）＝防抖量级：上限后首档 2×base=1200s
+GATEWAY_RESTART_BACKOFF_CAP = 1800    # 退避上限（秒）
+_DEP_INSTALL_PATTERNS = ("pip install", "uv sync", "pip sync", "pip check", "uv pip install")
+_SCENE_DIR = os.path.expanduser("~/.hermes/logs")
+
+_last_restart_time = 0        # tether.service 自愈防抖计时
+_last_gw_restart_time = 0     # 网关重启防抖计时（与 tether 分开，互不干扰）
+_gw_restart_history = []      # 网关重启时刻列表（滚动 1 小时窗口）
+
+
+def _gw_dep_install_in_progress():
+    """检测是否有人正在装依赖（网关启动时会自装缺失 extras）
+
+    返回 (bool, 详情)。命中即**完全不动网关**——升级/补依赖期间打断它，
+    等于让依赖永远装不完（2026-09-15 死锁根因）。
+    遍历 /proc 而非 pgrep：避免本地命令行自我指涉造成假命中。
+    """
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().decode("utf-8", "replace").replace("\x00", " ").strip()
+        except Exception:
+            continue
+        if not cmd:
+            continue
+        if any(p in cmd for p in _DEP_INSTALL_PATTERNS):
+            return True, f"pid={pid} {cmd[:120]}"
+    return False, ""
+
+
+def _capture_gateway_restart_scene(reason):
+    """重启前落现场：内存/进程/端口/依赖安装进程/journal 摘要 → 便于事后定位"""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(_SCENE_DIR, f"gateway-restart-scene-{ts}.txt")
+    try:
+        chunks = [f"# 网关重启现场 {time.strftime('%F %T')}", f"# 触发原因: {reason}", ""]
+        probes = [
+            ("free -m", "free -m"),
+            ("top mem procs", "ps -eo pid,ppid,rss,etime,comm,args --sort=-rss | head -15"),
+            ("dep install procs", "ps -eo pid,etime,args | grep -E 'pip[ ]install|[u]v sync' | head -5"),
+            ("gateway health", f"curl -s -m 5 http://127.0.0.1:{GATEWAY_PORT}/health || echo '<no 200>'"),
+            ("unit status", "systemctl --user status hermes-gateway.service --no-pager -n 5"),
+            ("journal tail", "journalctl --user -u hermes-gateway.service -n 20 --no-pager"),
+        ]
+        for title, cmd in probes:
+            try:
+                r = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=20)
+                chunks.append(f"## {title}\n{(r.stdout or '').strip()[:4000]}\n{(r.stderr or '').strip()[:500]}")
+            except Exception as e:
+                chunks.append(f"## {title}\n<probe failed: {str(e)[:80]}>")
+        with open(path, "w") as f:
+            f.write("\n".join(chunks))
+        log(f"📸 网关重启现场已落盘: {path}")
+    except Exception as e:
+        log(f"⚠️ 落现场失败: {str(e)[:80]}")
+    return path
+
+
+def _gateway_restart_guard(now):
+    """重启闸门：返回 (是否允许, 原因)。三道闸门见文件顶部说明。"""
+    installing, detail = _gw_dep_install_in_progress()
+    if installing:
+        return False, f"依赖安装进行中，跳过重启（{detail}）"
+    if now - _last_gw_restart_time < GATEWAY_RESTART_DEBOUNCE:
+        left = int(GATEWAY_RESTART_DEBOUNCE - (now - _last_gw_restart_time))
+        return False, f"防抖窗口内（{left}s 后解除）"
+    recent = [t for t in _gw_restart_history if now - t < 3600]
+    if len(recent) >= GATEWAY_RESTART_MAX_PER_HOUR:
+        over = len(recent) - GATEWAY_RESTART_MAX_PER_HOUR + 1
+        backoff = min(GATEWAY_RESTART_BACKOFF_BASE * (2 ** over), GATEWAY_RESTART_BACKOFF_CAP)
+        if now - _last_gw_restart_time < backoff:
+            return False, f"1 小时内已重启 {len(recent)} 次，退避至间隔 {backoff}s 后再试"
+    return True, "ok"
 
 
 def _is_gateway_alive():
@@ -273,13 +359,21 @@ def _is_gateway_alive():
 def _ensure_gateway_alive():
     """如果 Gateway 挂了，先反复确认，再尝试重启
 
-    重启防抖 30 秒。但在判定死亡前先做多次探测，
-    给 Gateway 自己恢复的机会（如飞书 WebSocket 重连期间的短暂无响应）。
+    加固后（2026-09-16，主人批准）：防抖 10 分钟 + 依赖安装期间不重启 +
+    1 小时重启次数上限/指数退避 + 重启前落现场。设计动机见文件顶部
+    「网关重启加固」注释（2026-09-15 升级死锁）。
     """
-    global _last_restart_time
+    global _last_gw_restart_time
     now = time.time()
-    if now - _last_restart_time < 30:
-        return  # 防抖：30秒内不重复重启
+
+    # 闸门前置检查：正在装依赖就别动它，连探测都省（探测期间的 25 秒也白等）
+    installing, detail = _gw_dep_install_in_progress()
+    if installing:
+        log(f"⏸️ 检测到依赖安装进行中，暂不介入网关（{detail}）")
+        return
+
+    if now - _last_gw_restart_time < GATEWAY_RESTART_DEBOUNCE:
+        return  # 防抖：窗口内不重复重启
 
     # 第一次快速检查
     if _is_gateway_alive():
@@ -294,7 +388,17 @@ def _ensure_gateway_alive():
             return
     log("⚠️ Gateway 连续 25 秒无响应，准备重启")
 
-    _last_restart_time = now
+    allowed, reason = _gateway_restart_guard(time.time())
+    if not allowed:
+        log(f"⛔ 跳过重启：{reason}")
+        return
+
+    _capture_gateway_restart_scene(reason)
+    _last_gw_restart_time = time.time()
+    _gw_restart_history.append(_last_gw_restart_time)
+    # 只保留 1 小时窗口，避免无界增长
+    _gw_restart_history[:] = [t for t in _gw_restart_history if _last_gw_restart_time - t < 3600]
+
     try:
         subprocess.run(
             ["systemctl", "--user", "restart", "hermes-gateway.service"],
@@ -1551,7 +1655,9 @@ def main():
     # 启动时恢复因 watcher 重启而残留的未处理 handoff
     _recover_stale_handoffs()
 
-    log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s, 自愈={_SELF_HEAL_INTERVAL}s, 轮询模式)")
+    log(f"Watcher 已启动 (间隔={POLL_INTERVAL}s, 自愈={_SELF_HEAL_INTERVAL}s, 轮询模式, "
+        f"网关重启防抖={GATEWAY_RESTART_DEBOUNCE}s/上限={GATEWAY_RESTART_MAX_PER_HOUR}次每小时, "
+        f"依赖安装期不重启)")
     last_heal_time = 0.0
 
     while True:
