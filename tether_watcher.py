@@ -1,7 +1,7 @@
 #!/home/zzsky/.hermes/tether/venv/bin/python3
 """"
 Tether Watcher — 事件驱动消息处理器
-2 秒轮询 /messages?ack=1 获取新消息 + 监控 handoff 文件。
+2 秒轮询 /messages?ack=0 获取待处理消息（拉取时不标记，处理成功后才 ack）+ 监控 handoff 文件。
 处理完消息后自动将 agent 的回复 POST 回对方 Tether，无需 agent 手动执行命令。
 
 独立于 tether_server.py 运行，没有耦合。
@@ -1160,11 +1160,20 @@ FILE_MARKER_END = "{(完)}"
 # 新实现：拉取不标记（ack=0）→ 处理成功或明确跳过后才标记；失败则留在库里按
 # 退避重试，超过上限才标记并告警。写库直接进行（与 _ack_handoff 同路径，
 # watcher 与 server 同机共用 tether.db），故无需改动 server。
-_ACK_MAX_ATTEMPTS = 3          # 单条消息最多处理尝试次数
-_ACK_RETRY_BACKOFF = 60.0      # 两次尝试之间至少间隔（秒）
+#
+# ⚠️ 两类失败必须分开（mac review 2026-09-30 指出）：
+#   · offline（Gateway 不在线）：根本不调 LLM、零 token 成本 ⇒ 走长退避、不限次。
+#     否则一次两天级故障会让消息在 3 分钟内全被放弃，把本次修复的收益抵消掉。
+#   · llm（确实调了但失败）：烧 token ⇒ 单条最多 3 次，达上限放弃并告警。
+_ACK_MAX_ATTEMPTS = 3          # LLM 真失败：单条最多尝试次数
+_ACK_RETRY_BACKOFF = 60.0      # LLM 失败后的退避（秒）
+_ACK_OFFLINE_BACKOFF = 300.0   # Gateway 不在线：长退避（零 token，可放心重试）
+_ACK_OFFLINE_MAX_ATTEMPTS = 0  # 0 = 不限次（长故障期不放弃消息）
 _ACK_FAIL_STREAK_ALERT = 3     # 连续失败消息数达此值 → 通知主人
 _ACK_ALERT_COOLDOWN = 900.0    # 同类告警去重冷却（秒）
-_FAILED_ATTEMPTS = {}          # msg_id -> [attempts, last_fail_ts]
+_ACK_SKIP_LOG_INTERVAL = 30.0  # 同一消息"退避中"日志最小间隔（防 2s 轮询刷屏）
+_FAILED_ATTEMPTS = {}          # msg_id -> [attempts, last_fail_ts, kind]
+_SKIP_LOG_TS = {}              # msg_id -> 上次打印"退避中"日志的时间
 _ACK_ALERT_STATE = {"streak": 0, "last_alert": 0.0}
 
 
@@ -1180,6 +1189,7 @@ def _ack_incoming(msg_id):
         conn.commit()
         conn.close()
         _FAILED_ATTEMPTS.pop(msg_id, None)
+        _SKIP_LOG_TS.pop(msg_id, None)
         return True
     except Exception as e:
         log(f"⚠️ 入站 ack 标记失败 {msg_id[:8]}: {str(e)[:60]}")
@@ -1191,31 +1201,56 @@ def _inbound_ready(msg_id):
     st = _FAILED_ATTEMPTS.get(msg_id)
     if not st:
         return True
-    attempts, last_ts = st
-    if attempts >= _ACK_MAX_ATTEMPTS:
-        return False
+    attempts, last_ts = st[0], st[1]
+    kind = st[2] if len(st) > 2 else "llm"
+    if kind == "offline":
+        if _ACK_OFFLINE_MAX_ATTEMPTS and attempts >= _ACK_OFFLINE_MAX_ATTEMPTS:
+            return False
+        backoff = _ACK_OFFLINE_BACKOFF
+    else:
+        if attempts >= _ACK_MAX_ATTEMPTS:
+            return False
+        backoff = _ACK_RETRY_BACKOFF
     import time as _t
-    return (_t.time() - last_ts) >= _ACK_RETRY_BACKOFF
+    return (_t.time() - last_ts) >= backoff
 
 
-def _register_inbound_failure(msg_id, why=""):
-    """登记一次处理失败：累加计数 → 必要时告警 → 达上限则标记放弃。"""
+def _should_log_skip(msg_id):
+    """同一条退避消息的日志限流：每 _ACK_SKIP_LOG_INTERVAL 秒最多一行。"""
+    import time as _t
+    now = _t.time()
+    if now - _SKIP_LOG_TS.get(msg_id, 0.0) < _ACK_SKIP_LOG_INTERVAL:
+        return False
+    _SKIP_LOG_TS[msg_id] = now
+    return True
+
+
+def _register_inbound_failure(msg_id, why="", kind="llm"):
+    """登记一次处理失败：累加计数 → 必要时告警 → 达上限则标记放弃。
+
+    kind: "llm"     = 确实调用了 Gateway/LLM 但失败（烧 token，有上限）
+          "offline" = Gateway 不在线，未调 LLM（零成本，长退避不限次）
+    """
     import time as _t
     now = _t.time()
     st = _FAILED_ATTEMPTS.get(msg_id)
     attempts = (st[0] if st else 0) + 1
-    _FAILED_ATTEMPTS[msg_id] = [attempts, now]
+    _FAILED_ATTEMPTS[msg_id] = [attempts, now, kind]
 
-    if attempts >= _ACK_MAX_ATTEMPTS:
+    max_att = _ACK_OFFLINE_MAX_ATTEMPTS if kind == "offline" else _ACK_MAX_ATTEMPTS
+    backoff = _ACK_OFFLINE_BACKOFF if kind == "offline" else _ACK_RETRY_BACKOFF
+
+    if max_att and attempts >= max_att:
         # 达上限：标记已读，避免无限重试（留下明确日志）
         _ack_incoming(msg_id)
         _FAILED_ATTEMPTS.pop(msg_id, None)
         log(f"🚫 {msg_id[:8]} 处理失败 {attempts} 次，放弃并标记（{why[:60]}）")
     else:
-        log(f"↻ {msg_id[:8]} 处理失败 {attempts}/{_ACK_MAX_ATTEMPTS}，"
-            f"{int(_ACK_RETRY_BACKOFF)}s 后重试（{why[:60]}）")
+        limit = str(max_att) if max_att else "∞"
+        log(f"↻ {msg_id[:8]} 处理失败 {attempts}/{limit}（{kind}），"
+            f"{int(backoff)}s 后重试（{why[:60]}）")
 
-    # 连续失败告警（带冷却，避免刷屏）
+    # 连续失败告警（带冷却，避免刷屏；offline 长期也会周期性提醒）
     _ACK_ALERT_STATE["streak"] += 1
     if (_ACK_ALERT_STATE["streak"] >= _ACK_FAIL_STREAK_ALERT
             and now - _ACK_ALERT_STATE["last_alert"] >= _ACK_ALERT_COOLDOWN):
@@ -1223,9 +1258,11 @@ def _register_inbound_failure(msg_id, why=""):
         streak = _ACK_ALERT_STATE["streak"]
         _ACK_ALERT_STATE["streak"] = 0
         try:
+            tail = (f"，超过 {max_att} 次会放弃并标记。" if max_att
+                    else "（offline 不限次）。")
             _send_notification(
-                f"⚠️ Tether 入站消息连续处理失败 {streak} 条，最新原因：{why[:200]}\n"
-                f"消息仍保留在库中按退避重试，超过 {_ACK_MAX_ATTEMPTS} 次会放弃并标记。"
+                f"⚠️ Tether 入站消息连续处理失败 {streak} 条（{kind}），"
+                f"最新原因：{why[:200]}\n消息保留在库中按退避重试" + tail
             )
         except Exception as e:
             log(f"⚠️ 失败告警发送异常: {str(e)[:60]}")
@@ -1261,7 +1298,8 @@ def process_messages():
 
             # 失败过的消息：未过退避时间则本轮不重试（不标记，下轮再判）
             if not _inbound_ready(mid_key):
-                log(f"\u23ed {mid} 退避中，本轮跳过")
+                if _should_log_skip(mid_key):
+                    log(f"\u23ed {mid} 退避中，本轮跳过")
                 continue
 
             log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
@@ -1310,6 +1348,7 @@ def process_messages():
 
             output = None
             fail_why = ""
+            fail_kind = "llm"
 
             if _is_gateway_alive():
                 output, err = _gateway_chat(prompt, timeout=300)
@@ -1318,9 +1357,11 @@ def process_messages():
                     log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
                 else:
                     fail_why = f"Gateway 处理失败 ({err or 'no output'})"
+                    fail_kind = "llm"       # 真调了 LLM 才失败 → 计次上限
                     log(f"❌ {mid} {fail_why}")
             else:
                 fail_why = "Gateway 不在线"
+                fail_kind = "offline"       # 未调 LLM、零 token → 长退避不限次
                 log(f"❌ {mid} {fail_why}")
 
             # 汇报或自动回复：Report 发 notification，其他回发送方
@@ -1345,9 +1386,9 @@ def process_messages():
                     if output:
                         log(f"⏭ {mid} 跳过 auto-reply（is_reply 消息）")
 
-            # 结果落账：成功/明确跳过的标记已读；失败登记重试（退避+上限+告警）
+            # 结果落账：成功/明确跳过的标记已读；失败登记重试（offline 长退避不限次 / llm 3 次上限）
             if fail_why:
-                _register_inbound_failure(mid_key, fail_why)
+                _register_inbound_failure(mid_key, fail_why, fail_kind)
             else:
                 _ack_incoming(mid_key)
 
