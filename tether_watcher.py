@@ -1239,12 +1239,18 @@ def process_messages():
                     # → 主人收不到汇报（本次修复的主项）
                     _send_notification(output)
 
-                # ⚠️ 2026-09-30 收窄（原清单第 2 项）：info 消息**不再**把 agent 输出回发对端。
-                # 理由：info 是单向通知，handoff 才是「请处理并回应」。对 info 的处理结果
-                # 做 auto-reply，会把两端各自的中间分析/报错互相弹射，是主要噪音源。
-                # 需要闭环的协作一律走 handoff —— process_handoffs 分支保留回发。
-                if output:
-                    log(f"⏭ {mid} info 消息不回发对端（收窄后仅 handoff 回发，{len(output)} chars）")
+                # ⚠️ 2026-09-30 回退（原清单第 2 项撤销）：info 消息**恢复**回发对端。
+                # 撤销理由（mac 复核提出，tp 已核实）：实测两端全部协作消息都走 info
+                # （tp 入站 14/14 为 info；mac 入站 10/14 为 info），且 mac 的自动回复本身
+                # 也是 info 类型 —— 停掉 info 回发会让两端对话彻底静默，且不报错。
+                # 防回环原本就由 is_reply 标记保证（回发消息带 is_reply=True，对端收到即跳过），
+                # 不存在无限弹射，故无需收窄。噪音由 _is_noise_output（占位符/纯确认）
+                # 与 _is_error_output（报错/限流文本）在出口拦截即可。
+                if not is_reply:
+                    _auto_reply(output, sender, msg.get("id", ""))
+                else:
+                    if output:
+                        log(f"⏭ {mid} 跳过 auto-reply（is_reply 消息）")
 
         log(f"✅ 本轮处理完成 ({len(msgs)} 条)")
         return len(msgs)
