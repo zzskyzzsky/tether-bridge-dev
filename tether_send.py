@@ -215,7 +215,11 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
                 try:
                     conn = sqlite3.connect(DB_PATH, timeout=3)
                     conn.execute(
-                        "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,0)",
+                        # acked=1：本路径只在 POST 成功后执行，与 watcher 成功路径
+                        # （tether_watcher.py:975）语义一致。原写 0 会被
+                        # _check_outgoing_retry 判为未确认，30 秒后重发一次 →
+                        # 对端收到两份（CLI 发起消息的重复投递根因，mac 现网确认）。
+                        "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
                         (msg_id, host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
                     )
                     conn.commit()
