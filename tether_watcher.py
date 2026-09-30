@@ -176,6 +176,49 @@ def _is_noise_output(text):
         return True
     return False
 
+
+# 出口报错文本特征（用于切断两端互激）
+_ERROR_FORWARD_MARKERS = (
+    "api call failed after",     # 上游重试耗尽
+    "http 429",                  # 限流
+    "429 too many requests",
+    "usage limit",               # 额度耗尽
+    "rate limit exceeded",
+    "quota exceeded",
+    "insufficient balance",
+)
+
+# 结论/处置词：出现即视为「有效结论」而非报错转述，一律放行
+_ERROR_RESOLVED_WORDS = (
+    "已修复", "已处理", "已解决", "已恢复", "已规避", "无需处理",
+    "结论", "建议", "原因是", "根因",
+)
+
+
+def _is_error_output(text):
+    """出口报错文本判定：True = 疑似上游故障/限流文本，不应转发对端。
+
+    ⚠️ 判定原则（沿用 _is_noise_output 的回归教训，不做裸子串匹配）：
+      0) 含结论/处置词 → 一律放行（「本次故障由 HTTP 429 引起，已修复」是有效结论）；
+      1) 报错标记出现在**开头**（前 60 字符内）—— 输出主体就是报错；
+      2) 或文本**很短**（<=150 字）且含报错标记 —— 整条基本就是报错。
+
+    背景：额度限流期 A 端报错 → auto-reply 转给 B 端 → B 端 LLM 也报错 → 再转回 A，
+    两端互相弹射、越滚越多。在出口拦掉即可切断；本地仍记日志可查。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    if any(w in s for w in _ERROR_RESOLVED_WORDS):
+        return False
+    low = s.lower()
+    if any(m in low[:60] for m in _ERROR_FORWARD_MARKERS):
+        return True
+    if len(s) <= 150 and any(m in low for m in _ERROR_FORWARD_MARKERS):
+        return True
+    return False
+
+
 # 超时唤醒去重缓存
 _HANDOFF_TIMEOUT_CACHE = {}  # outgoing_msg_id -> timestamp
 _HANDOFF_TIMEOUT_MINUTES = 15  # 默认15分钟（之前5分钟，通知太频繁）
@@ -834,6 +877,12 @@ def _auto_reply(output, sender_info, original_msg_id=None):
         log(f"⏭️ auto-reply 跳过：占位符/纯确认文本（{output.strip()[:20]!r}）")
         return
 
+    # ⚠️ 出口报错过滤（2026-09-30）：上游报错/限流文本不外发对端，切断两端互激。
+    # 限流期两端会互相转发彼此的错误文本，形成正反馈；在出口拦掉即可切断。
+    if _is_error_output(output):
+        log(f"⏭️ auto-reply 跳过：疑似上游报错文本（{output.strip()[:40]!r}）")
+        return
+
     # 目标主机：优先 TETHER_PEER_HOST（IP 直连，不依赖短名解析）
     # 2026-09-01 修复保留（当时 mac 解析不了 zzskytpg3 → auto-reply 全部 DNS 失败）。
     # 2026-09-10 MagicDNS 短名已修好（Clash hosts + ts.net 解析策略），但 IP 直连更稳，
@@ -1190,13 +1239,12 @@ def process_messages():
                     # → 主人收不到汇报（本次修复的主项）
                     _send_notification(output)
 
-                # is_reply 消息跳过 auto-reply，防止回环
-                # 对端 watcher 已处理过，我们 Gateway 收到上下文即可继续推进
-                if not is_reply:
-                    _auto_reply(output, sender, msg.get("id", ""))
-                else:
-                    if output:
-                        log(f"⏭ {mid} 跳过 auto-reply（is_reply 消息）")
+                # ⚠️ 2026-09-30 收窄（原清单第 2 项）：info 消息**不再**把 agent 输出回发对端。
+                # 理由：info 是单向通知，handoff 才是「请处理并回应」。对 info 的处理结果
+                # 做 auto-reply，会把两端各自的中间分析/报错互相弹射，是主要噪音源。
+                # 需要闭环的协作一律走 handoff —— process_handoffs 分支保留回发。
+                if output:
+                    log(f"⏭ {mid} info 消息不回发对端（收窄后仅 handoff 回发，{len(output)} chars）")
 
         log(f"✅ 本轮处理完成 ({len(msgs)} 条)")
         return len(msgs)
