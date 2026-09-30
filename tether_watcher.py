@@ -1153,6 +1153,84 @@ FILE_MARKER_START = "{(文件传输)}"
 FILE_MARKER_END = "{(完)}"
 
 
+# ===== 入站消息确认（2026-09-30 待批项落地）=====
+# 原实现：GET /messages?ack=1 —— 拉取即标记已读。Gateway 处理失败的消息
+# 不会重放 → 内容永久丢失（2026-09-28~09-30 api_server 故障期间实证丢了多条，
+# 包括 mac 的一条 BLOCKER）。
+# 新实现：拉取不标记（ack=0）→ 处理成功或明确跳过后才标记；失败则留在库里按
+# 退避重试，超过上限才标记并告警。写库直接进行（与 _ack_handoff 同路径，
+# watcher 与 server 同机共用 tether.db），故无需改动 server。
+_ACK_MAX_ATTEMPTS = 3          # 单条消息最多处理尝试次数
+_ACK_RETRY_BACKOFF = 60.0      # 两次尝试之间至少间隔（秒）
+_ACK_FAIL_STREAK_ALERT = 3     # 连续失败消息数达此值 → 通知主人
+_ACK_ALERT_COOLDOWN = 900.0    # 同类告警去重冷却（秒）
+_FAILED_ATTEMPTS = {}          # msg_id -> [attempts, last_fail_ts]
+_ACK_ALERT_STATE = {"streak": 0, "last_alert": 0.0}
+
+
+def _ack_incoming(msg_id):
+    """标记入站消息已在本机处理完毕（acked=1），使其不再被拉取。"""
+    if not msg_id:
+        return False
+    try:
+        import sqlite3 as _sq
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        conn = _sq.connect(db_path, timeout=3)
+        conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
+        conn.commit()
+        conn.close()
+        _FAILED_ATTEMPTS.pop(msg_id, None)
+        return True
+    except Exception as e:
+        log(f"⚠️ 入站 ack 标记失败 {msg_id[:8]}: {str(e)[:60]}")
+        return False
+
+
+def _inbound_ready(msg_id):
+    """失败过的消息是否已过退避时间、可再次尝试。未曾失败的消息总是就绪。"""
+    st = _FAILED_ATTEMPTS.get(msg_id)
+    if not st:
+        return True
+    attempts, last_ts = st
+    if attempts >= _ACK_MAX_ATTEMPTS:
+        return False
+    import time as _t
+    return (_t.time() - last_ts) >= _ACK_RETRY_BACKOFF
+
+
+def _register_inbound_failure(msg_id, why=""):
+    """登记一次处理失败：累加计数 → 必要时告警 → 达上限则标记放弃。"""
+    import time as _t
+    now = _t.time()
+    st = _FAILED_ATTEMPTS.get(msg_id)
+    attempts = (st[0] if st else 0) + 1
+    _FAILED_ATTEMPTS[msg_id] = [attempts, now]
+
+    if attempts >= _ACK_MAX_ATTEMPTS:
+        # 达上限：标记已读，避免无限重试（留下明确日志）
+        _ack_incoming(msg_id)
+        _FAILED_ATTEMPTS.pop(msg_id, None)
+        log(f"🚫 {msg_id[:8]} 处理失败 {attempts} 次，放弃并标记（{why[:60]}）")
+    else:
+        log(f"↻ {msg_id[:8]} 处理失败 {attempts}/{_ACK_MAX_ATTEMPTS}，"
+            f"{int(_ACK_RETRY_BACKOFF)}s 后重试（{why[:60]}）")
+
+    # 连续失败告警（带冷却，避免刷屏）
+    _ACK_ALERT_STATE["streak"] += 1
+    if (_ACK_ALERT_STATE["streak"] >= _ACK_FAIL_STREAK_ALERT
+            and now - _ACK_ALERT_STATE["last_alert"] >= _ACK_ALERT_COOLDOWN):
+        _ACK_ALERT_STATE["last_alert"] = now
+        streak = _ACK_ALERT_STATE["streak"]
+        _ACK_ALERT_STATE["streak"] = 0
+        try:
+            _send_notification(
+                f"⚠️ Tether 入站消息连续处理失败 {streak} 条，最新原因：{why[:200]}\n"
+                f"消息仍保留在库中按退避重试，超过 {_ACK_MAX_ATTEMPTS} 次会放弃并标记。"
+            )
+        except Exception as e:
+            log(f"⚠️ 失败告警发送异常: {str(e)[:60]}")
+
+
 def process_messages():
     """从 Tether 拉取未处理消息并逐一处理。返回本次处理的消息数。
 
@@ -1164,7 +1242,8 @@ def process_messages():
         return 0
     _processing = True
     try:
-        data, err = _tether_get("/messages?ack=1")
+        # ack=0：拉取时不自动标记已读，改由处理结果决定（详见本文件「入站消息确认」节）
+        data, err = _tether_get("/messages?ack=0")
         if err or not data:
             log(f"取消息失败: {err}")
             return 0
@@ -1173,16 +1252,24 @@ def process_messages():
         if not msgs:
             return 0
 
-        log(f"\U0001f4ec {len(msgs)} 条新消息")
+        log(f"\U0001f4ec {len(msgs)} 条待处理消息")
         for msg in msgs:
-            mid = msg.get("id", "?")[:8]
+            mid_key = msg.get("id", "")
+            mid = mid_key[:8] or "?"
             sender = msg.get("sender", "unknown")
             content = msg.get("message", "")
+
+            # 失败过的消息：未过退避时间则本轮不重试（不标记，下轮再判）
+            if not _inbound_ready(mid_key):
+                log(f"\u23ed {mid} 退避中，本轮跳过")
+                continue
+
             log(f"\u25b6 处理 {mid} from={sender}: {content[:80]}")
 
             # 跳过 auto_reply 类型消息（旧格式安全兜底，新格式走 is_reply 逻辑）
             if msg.get("type") == "auto_reply":
                 log(f"\u23ed {mid} 跳过（旧格式 auto_reply）")
+                _ack_incoming(mid_key)
                 continue
 
             # 检查 is_reply 标记：回复消息处理但不 auto-reply 回去（防回环）
@@ -1193,6 +1280,7 @@ def process_messages():
             if ttl is not None:
                 if ttl <= 0:
                     log(f"\u23ed {mid} 跳过（TTL={ttl}，已达零，防止消息循环）")
+                    _ack_incoming(mid_key)
                     continue
                 else:
                     # TTL 减 1 后转发
@@ -1206,10 +1294,12 @@ def process_messages():
             # 入站噪音判定（判定逻辑抽到模块级 _is_skip_noise，便于单测）
             if _is_skip_noise(content):
                 log(f"\u23ed {mid} 跳过（确认循环/纯噪音消息）")
+                _ack_incoming(mid_key)
                 continue
 
             # 文件传输控制消息：直接处理，不走 Gateway
             if _handle_file_transfer(content, sender, mid):
+                _ack_incoming(mid_key)
                 continue
 
             prompt = (
@@ -1219,6 +1309,7 @@ def process_messages():
             )
 
             output = None
+            fail_why = ""
 
             if _is_gateway_alive():
                 output, err = _gateway_chat(prompt, timeout=300)
@@ -1226,9 +1317,11 @@ def process_messages():
                     has_out = bool(output)
                     log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
                 else:
-                    log(f"❌ Gateway 处理失败 ({err or 'no output'}), 消息跳过")
+                    fail_why = f"Gateway 处理失败 ({err or 'no output'})"
+                    log(f"❌ {mid} {fail_why}")
             else:
-                log(f"❌ Gateway 不在线，消息跳过")
+                fail_why = "Gateway 不在线"
+                log(f"❌ {mid} {fail_why}")
 
             # 汇报或自动回复：Report 发 notification，其他回发送方
             if output and sender:
@@ -1247,10 +1340,16 @@ def process_messages():
                 # 不存在无限弹射，故无需收窄。噪音由 _is_noise_output（占位符/纯确认）
                 # 与 _is_error_output（报错/限流文本）在出口拦截即可。
                 if not is_reply:
-                    _auto_reply(output, sender, msg.get("id", ""))
+                    _auto_reply(output, sender, mid_key)
                 else:
                     if output:
                         log(f"⏭ {mid} 跳过 auto-reply（is_reply 消息）")
+
+            # 结果落账：成功/明确跳过的标记已读；失败登记重试（退避+上限+告警）
+            if fail_why:
+                _register_inbound_failure(mid_key, fail_why)
+            else:
+                _ack_incoming(mid_key)
 
         log(f"✅ 本轮处理完成 ({len(msgs)} 条)")
         return len(msgs)
