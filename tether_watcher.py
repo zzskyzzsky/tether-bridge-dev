@@ -1289,7 +1289,18 @@ def process_messages():
         if not msgs:
             return 0
 
-        log(f"\U0001f4ec {len(msgs)} 条待处理消息")
+        # ⚠️ 2026-10-08 修（mac 实测 8 分钟刷 61 对）：退避中的消息也在这份 msgs 里，
+        # 若照旧无脑打印「📬 N 条 / ✅ 本轮完成」，故障与退避期间 2 秒轮询会成对刷屏。
+        # ⇒ 先按退避门槛筛出本轮真能处理的消息；全都不可处理时只留一行限流日志。
+        ready = [m for m in msgs if _inbound_ready(m.get("id", ""))]
+        if not ready:
+            if _should_log_skip("__round__"):
+                log(f"\u23ed {len(msgs)} 条消息均在退避中，本轮跳过"
+                    f"（该行每 {_ACK_SKIP_LOG_INTERVAL}s 最多一次）")
+            return 0
+
+        extra = f"（另 {len(msgs) - len(ready)} 条退避中）" if len(msgs) > len(ready) else ""
+        log(f"\U0001f4ec {len(ready)} 条待处理消息{extra}")
         for msg in msgs:
             mid_key = msg.get("id", "")
             mid = mid_key[:8] or "?"
@@ -1392,8 +1403,8 @@ def process_messages():
             else:
                 _ack_incoming(mid_key)
 
-        log(f"✅ 本轮处理完成 ({len(msgs)} 条)")
-        return len(msgs)
+        log(f"✅ 本轮处理完成 ({len(ready)} 条)")
+        return len(ready)
     finally:
         _processing = False
 
