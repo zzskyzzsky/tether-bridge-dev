@@ -203,11 +203,20 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
         pass  # DNS 失败，无 fallback
 
     last_err = None
+    # 内网 / tailnet 目标必须绕过 HTTP 代理：Clash 会对 127./172.20/100.x 返 502，
+    # 而 urllib 只认 NO_PROXY 里的精确主机名或域名后缀，不认 100.64.0.0/10 这类 CIDR。
+    # 公共目标（如 VPS 公网 IP）保持默认 opener，行为与加代理前一致。
+    _direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    _default_opener = urllib.request.build_opener()
+
+    def _opener_for(host):
+        return _direct_opener if host.startswith(("100.", "127.", "10.", "172.", "169.254.")) else _default_opener
+
     for host, p in targets:
         url = f"http://{host}:{p}/message"
         for attempt in range(2):
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with _opener_for(host).open(req, timeout=10) as resp:
                     result = json.loads(resp.read().decode())
                 msg_id = result.get("message_id", "?")
                 print(f"✅ [{msg_type}] → {host}:{p}  message_id={msg_id[:8]}")
