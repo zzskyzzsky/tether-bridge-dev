@@ -794,12 +794,30 @@ def _write_report_to_file(content):
         pass
 
 
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_DEFAULT_OPENER = urllib.request.build_opener()
+
+
+def _opener_for(peer_url):
+    """内网 / tailnet 目标必须绕过 HTTP 代理。
+
+    Clash 对 100.x / 172.x / 10.x 这类目标会直接返 502，而 urllib 的 NO_PROXY
+    只认精确主机名或域名后缀、不认 CIDR（2026-11-12 实证：出站队列对
+    100.109.129.111:9003 每 5–10 秒重试全 502，消息卡死不投递）。
+    与 tether_send.py 的内网判断保持同一套口径。
+    """
+    host = (peer_url.split("//", 1)[-1].split("/")[0].split(":")[0] or "").lower()
+    if host.startswith(("100.", "127.", "10.", "172.", "169.254.", "localhost")):
+        return _DIRECT_OPENER
+    return _DEFAULT_OPENER
+
+
 def _try_post(peer_url, payload, timeout=10):
     """尝试 POST 到指定 URL，返回 (success, error_msg)"""
     try:
         req = urllib.request.Request(peer_url, data=payload,
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout):
+        with _opener_for(peer_url).open(req, timeout=timeout):
             return True, None
     except Exception as e:
         return False, str(e)[:100]
