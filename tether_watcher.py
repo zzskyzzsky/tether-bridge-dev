@@ -24,6 +24,8 @@ GATEWAY_SESSION = "tether-watcher"
 GATEWAY_SESSION_MAX_MESSAGES = 240
 # 单条消息的处理上限。旧值 300s 在大上下文下必超时；正常（重置后）一条 1 分钟内结束。
 GATEWAY_CHAT_TIMEOUT = 600
+# 已确认存在的 gateway 会话名（主会话 + 重试会话 -r{n}），避免每次调用重复 POST 建会话
+_ENSURED_GW_SESSIONS = set()
 GATEWAY_ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive")
 GATEWAY_API_KEY = ""
 HANDOFF_RESULT_FILE = "/tmp/tether_handoff_result.json"
@@ -201,6 +203,33 @@ _ERROR_RESOLVED_WORDS = (
     "结论", "建议", "原因是", "根因",
 )
 
+# ⚠️ 网关「回合被中断」提示文案（2026-11-20 事件取证）：
+# 超时/重启后重试会复用同一 session，网关把旧回合顶掉，并以 HTTP 200 的
+# 正常 content 返回「⚠️ No reply: the turn was stopped…（…took over）」。
+# watcher 若当成模型答案，就会把它 auto-reply 出去（实测 183 chars 原样外发 3 次），
+# 对端只收到噪音；且本条入站被误判为成功 ack → 真答案丢失。必须按失败处理。
+_GATEWAY_INTERRUPT_MARKERS = (
+    "no reply:",           # ⚠️ No reply: the turn was stopped / stalled
+    "turn was stopped",    # 回合被接管/中断
+    "turn was stalled",    # 回合停滞
+    "api call failed",     # 上游重试耗尽（网关也可能以正文返回）
+)
+
+
+def _is_gateway_interrupt(text):
+    """True = 输出其实是网关的回合中断提示，不是模型答案。
+
+    只判开头（锚定前缀，最多允许前置 ⚠️/❌/标点），避免误杀正文里引用该文案的复盘消息；
+    另对前 40 字符内出现标记的文本放宽命中，覆盖网关加了小前缀的变体。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    head = s[:200].lower().lstrip("\u26a0\ufe0f\u2049\u274c!? \t\r\n")
+    if head.startswith(_GATEWAY_INTERRUPT_MARKERS):
+        return True
+    return any(m in head[:40] for m in _GATEWAY_INTERRUPT_MARKERS)
+
 
 def _is_error_output(text):
     """出口报错文本判定：True = 疑似上游故障/限流文本，不应转发对端。
@@ -218,6 +247,8 @@ def _is_error_output(text):
         return False
     if any(w in s for w in _ERROR_RESOLVED_WORDS):
         return False
+    if _is_gateway_interrupt(s):
+        return True
     low = s.lower()
     if any(m in low[:60] for m in _ERROR_FORWARD_MARKERS):
         return True
@@ -520,9 +551,16 @@ def _gateway_headers():
     return h
 
 
-def _gateway_chat(message, timeout=GATEWAY_CHAT_TIMEOUT):
-    """通过 Gateway API 处理消息，返回 (output, error)"""
-    url = f"{GATEWAY_URL}/api/sessions/{GATEWAY_SESSION}/chat"
+def _gateway_chat(message, timeout=GATEWAY_CHAT_TIMEOUT, session=None):
+    """通过 Gateway API 处理消息，返回 (output, error)
+
+    session：默认主会话 GATEWAY_SESSION；重试轮传独立会话（见 _session_for_attempt），
+    避免新回合接管仍在跑的旧回合（旧回合被停 → 对端收到 turn was stopped 噪音）。
+    """
+    session = session or GATEWAY_SESSION
+    if session != GATEWAY_SESSION:
+        _ensure_gateway_session(session)
+    url = f"{GATEWAY_URL}/api/sessions/{session}/chat"
     headers = _gateway_headers()
     payload = json.dumps({"message": message}).encode()
 
@@ -531,8 +569,13 @@ def _gateway_chat(message, timeout=GATEWAY_CHAT_TIMEOUT):
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 result = json.loads(resp.read().decode())
-            content = result.get("message", {}).get("content", "")
-            return content.strip(), None
+            content = (result.get("message", {}).get("content", "") or "").strip()
+            # 网关把回合中断文案当正常 content 返回 → 视为失败，交给退避重试，
+            # 绝不进回复路径（否则对端收到纯噪音，且真答案被这个 ack 丢掉）
+            if _is_gateway_interrupt(content):
+                log(f"⚠️ Gateway 返回回合中断提示（{session}）：{content[:60]!r}")
+                return None, "gateway turn interrupted"
+            return content, None
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
             err = str(e)
             if attempt == 0:
@@ -545,17 +588,35 @@ def _gateway_chat(message, timeout=GATEWAY_CHAT_TIMEOUT):
     return None, "Gateway 失败（重试耗尽）"
 
 
-def _ensure_gateway_session():
-    """确保 Gateway session 存在"""
+def _session_for_attempt(msg_id):
+    """重试轮换用独立会话：{主会话}-r{n}。
+
+    为什么：超时/重启后重试用同一 session 会顶掉仍在跑的旧回合，
+    旧回合被停 → 对端收到「turn was stopped」噪音；换会话后新旧回合互不干扰。
+    首次尝试（无失败记录）仍用主会话，成功后 _ack_incoming 会清掉计数 → 自动回主会话。
+    """
+    st = _FAILED_ATTEMPTS.get(msg_id)
+    n = st[0] if st else 0
+    return f"{GATEWAY_SESSION}-r{n}" if n else GATEWAY_SESSION
+
+
+def _ensure_gateway_session(session=None):
+    """确保 Gateway session 存在（默认主会话；重试会话按名创建一次）"""
+    session = session or GATEWAY_SESSION
+    if session in _ENSURED_GW_SESSIONS:
+        return
     url = f"{GATEWAY_URL}/api/sessions"
     headers = _gateway_headers()
-    payload = json.dumps({"title": GATEWAY_SESSION, "id": GATEWAY_SESSION}).encode()
+    payload = json.dumps({"title": session, "id": session}).encode()
     try:
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         urllib.request.urlopen(req, timeout=10)
-        log("Gateway session 已创建")
+        _ENSURED_GW_SESSIONS.add(session)
+        log(f"Gateway session 已创建（{session}）")
     except urllib.error.HTTPError as e:
-        if e.code != 409:
+        if e.code == 409:
+            _ENSURED_GW_SESSIONS.add(session)   # 已存在
+        else:
             log(f"Gateway session 创建失败: HTTP {e.code}")
     except Exception as e:
         log(f"Gateway 不可达: {str(e)[:60]}")
@@ -1324,6 +1385,15 @@ def _register_inbound_failure(msg_id, why="", kind="llm"):
         _ack_incoming(msg_id)
         _FAILED_ATTEMPTS.pop(msg_id, None)
         log(f"🚫 {msg_id[:8]} 处理失败 {attempts} 次，放弃并标记（{why[:60]}）")
+        # dead-letter：原文不删，仍在 messages 表（acked=1，按保留期清理）可回查；
+        # 同时推一条告警给主人（单条消息触发不了下面的连续失败线）
+        try:
+            _send_notification(
+                f"🚫 Tether 入站消息重试 {attempts} 次仍失败，已放弃并置 acked=1"
+                f"（原文保留在 tether.db 可回查）。原因：{why[:200]}"
+            )
+        except Exception as e:
+            log(f"⚠️ 放弃告警发送异常: {str(e)[:60]}")
     else:
         limit = str(max_att) if max_att else "∞"
         log(f"↻ {msg_id[:8]} 处理失败 {attempts}/{limit}（{kind}），"
@@ -1441,7 +1511,7 @@ def process_messages():
             fail_kind = "llm"
 
             if _is_gateway_alive():
-                output, err = _gateway_chat(prompt)
+                output, err = _gateway_chat(prompt, session=_session_for_attempt(mid_key))
                 if err is None and output is not None:
                     has_out = bool(output)
                     log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
