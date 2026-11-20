@@ -31,7 +31,17 @@ from datetime import datetime, timezone
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
 
 SENDER_NAME = socket.gethostname()
-SENDER_NICK = os.environ.get("TETHER_SENDER_NICK", "tp-小钉hermes")
+# ⚠️ 不要在这里硬编码任何一端的昵称：旧默认值 "tp-小钉hermes" 让 mac 从临时上下文
+# （没有 TETHER_SENDER_NICK 的 shell / execute_code 沙箱）发出的消息 sender 里含 "tp"，
+# VPS relay 用裸子串判方向 → 判定"来自 tp" → 转发回 mac 自己（2026-11-20 实证）。
+# 没有环境变量时退回"本机角色"，绝不猜对方的名字。
+_SENDER_HOSTNAME = socket.gethostname()
+_SENDER_ROLE = (
+    "mac-弟弟" if "mbp" in _SENDER_HOSTNAME.lower()
+    else "tp-哥哥" if "tpg" in _SENDER_HOSTNAME.lower()
+    else ""
+)
+SENDER_NICK = os.environ.get("TETHER_SENDER_NICK") or _SENDER_ROLE or _SENDER_HOSTNAME
 ENV_HOST_KEY = "TETHER_PEER_HOST"
 DEFAULT_PORT = int(os.environ.get("TETHER_PEER_PORT", "9003"))
 DEFAULT_TYPE = "info"
@@ -229,7 +239,9 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
                         # _check_outgoing_retry 判为未确认，30 秒后重发一次 →
                         # 对端收到两份（CLI 发起消息的重复投递根因，mac 现网确认）。
                         "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",
-                        (msg_id, host, f"{SENDER_NAME} ({SENDER_NICK})", message, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
+                        # 记录实际使用的昵称（sender_nick），不是模块默认值：
+                        # 旧写法写死 SENDER_NICK，--nick 覆盖时本地库会记错发送方。
+                        (msg_id, host, f"{SENDER_NAME} ({sender_nick})", message, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
                     )
                     conn.commit()
                     conn.close()
