@@ -18,6 +18,13 @@ HANDOFF_FILE = "/tmp/tether_handoff.json"
 HEARTBEAT_FILE = "/tmp/tether_watcher_heartbeat.json"
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8642")
 GATEWAY_SESSION = "tether-watcher"
+# 上下文膨胀会把每轮 LLM 往返拖到 30s 级（2026-10-23 实测：418 条消息 / 单次 prompt
+# 34 万 token → 一条消息里 7~10 次工具调用累计 5~6 分钟，超过旧的 300s 超时 →
+# 记 llm 失败 → 重试叠加 → 连续失败告警）。会话超阈值就归档并重建同名会话。
+GATEWAY_SESSION_MAX_MESSAGES = 240
+# 单条消息的处理上限。旧值 300s 在大上下文下必超时；正常（重置后）一条 1 分钟内结束。
+GATEWAY_CHAT_TIMEOUT = 600
+GATEWAY_ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive")
 GATEWAY_API_KEY = ""
 HANDOFF_RESULT_FILE = "/tmp/tether_handoff_result.json"
 POLL_INTERVAL = 2
@@ -513,7 +520,7 @@ def _gateway_headers():
     return h
 
 
-def _gateway_chat(message, timeout=300):
+def _gateway_chat(message, timeout=GATEWAY_CHAT_TIMEOUT):
     """通过 Gateway API 处理消息，返回 (output, error)"""
     url = f"{GATEWAY_URL}/api/sessions/{GATEWAY_SESSION}/chat"
     headers = _gateway_headers()
@@ -552,6 +559,60 @@ def _ensure_gateway_session():
             log(f"Gateway session 创建失败: HTTP {e.code}")
     except Exception as e:
         log(f"Gateway 不可达: {str(e)[:60]}")
+
+
+def _gateway_session_info():
+    """当前 Gateway 会话的元信息（拿 message_count 判上下文规模）"""
+    try:
+        req = urllib.request.Request(f"{GATEWAY_URL}/api/sessions/{GATEWAY_SESSION}",
+                                     headers=_gateway_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            d = json.loads(resp.read().decode())
+        return d.get("session", d) or {}
+    except Exception:
+        return {}
+
+
+def _archive_gateway_session():
+    """把当前会话全部消息落成 jsonl 归档，返回路径；失败返回 None"""
+    try:
+        os.makedirs(GATEWAY_ARCHIVE_DIR, exist_ok=True)
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(GATEWAY_ARCHIVE_DIR, f"{GATEWAY_SESSION}_{ts}.jsonl")
+        url = f"{GATEWAY_URL}/api/sessions/{GATEWAY_SESSION}/messages?limit=100000"
+        req = urllib.request.Request(url, headers=_gateway_headers())
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            d = json.loads(resp.read().decode())
+        rows = d.get("data") or d.get("messages") or []
+        with open(path, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        return path
+    except Exception as e:
+        log(f"⚠️ 会话归档失败: {str(e)[:80]}")
+        return None
+
+
+def _maybe_reset_gateway_session(force=False):
+    """上下文超阈值就归档并重建同名会话。
+
+    为什么要重建：api_server 链路不走 hygiene 的 150 条上限，压缩阈值（默认 0.5）
+    也远高于实际，导致会话只涨不缩；而上下文越大单步 LLM 越慢，最终必然撞超时。
+    """
+    count = int(_gateway_session_info().get("message_count") or 0)
+    if not force and count < GATEWAY_SESSION_MAX_MESSAGES:
+        return False
+    path = _archive_gateway_session()
+    try:
+        req = urllib.request.Request(f"{GATEWAY_URL}/api/sessions/{GATEWAY_SESSION}",
+                                     headers=_gateway_headers(), method="DELETE")
+        urllib.request.urlopen(req, timeout=30).close()
+    except Exception as e:
+        log(f"⚠️ 会话删除失败: {str(e)[:80]}")
+    _ensure_gateway_session()
+    log(f"♻️ Gateway 会话已重置（原 {count} 条 → 0，归档 {path or '失败'}）")
+    return True
 
 
 def _find_hermes():
@@ -1380,7 +1441,7 @@ def process_messages():
             fail_kind = "llm"
 
             if _is_gateway_alive():
-                output, err = _gateway_chat(prompt, timeout=300)
+                output, err = _gateway_chat(prompt)
                 if err is None and output is not None:
                     has_out = bool(output)
                     log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
@@ -1422,6 +1483,11 @@ def process_messages():
                 _ack_incoming(mid_key)
 
         log(f"✅ 本轮处理完成 ({len(ready)} 条)")
+        # 每轮结束后检查上下文规模，超阈值归档重置（防只涨不缩 → 单步变慢 → 超时）
+        try:
+            _maybe_reset_gateway_session()
+        except Exception as e:
+            log(f"⚠️ 会话重置检查异常: {str(e)[:60]}")
         return len(ready)
     finally:
         _processing = False
