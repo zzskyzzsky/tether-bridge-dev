@@ -6,7 +6,7 @@ Tether Watcher — 事件驱动消息处理器
 
 独立于 tether_server.py 运行，没有耦合。
 """
-import json, os, resource, subprocess, threading, time, urllib.request, uuid
+import json, os, resource, subprocess, threading, time, urllib.error, urllib.request, uuid
 from datetime import datetime, timezone
 
 # 设置本机请求绕过 HTTP 代理（MacBook 上可能配了 Clash 环境变量）
@@ -214,21 +214,36 @@ _GATEWAY_INTERRUPT_MARKERS = (
     "turn was stalled",    # 回合停滞
     "api call failed",     # 上游重试耗尽（网关也可能以正文返回）
 )
+# 中断文案的长度上限：真实文案 183 字符；更长的多半是正文（复盘/转录/报告），
+# 一旦误判成失败会连重试 3 次后丢弃真答案，代价远大于漏拦一条噪音
+_GATEWAY_INTERRUPT_MAXLEN = 300
+
+
+def _has_cjk(s):
+    return any("\u4e00" <= ch <= "\u9fff" for ch in (s or ""))
 
 
 def _is_gateway_interrupt(text):
     """True = 输出其实是网关的回合中断提示，不是模型答案。
 
-    只判开头（锚定前缀，最多允许前置 ⚠️/❌/标点），避免误杀正文里引用该文案的复盘消息；
-    另对前 40 字符内出现标记的文本放宽命中，覆盖网关加了小前缀的变体。
+    ⚠️ 只做锚定前缀判定（允许前置 ⚠️/❌/标点），**不做「前 N 字包含」的宽松匹配**：
+    2026-11-20 mac review 实测，宽松分支会把
+    「【mac】结论：…原文是 ⚠️ No reply: …」(214 字) 和「API call failed 这个词是…」(80 字)
+    这类正常复盘判成失败 → 真答案重试 3 次后丢弃，比漏拦噪音更糟。
+    另加两条护栏：长度 ≤300；`api call failed` 只在前 40 字符无中文时才算中断文案
+    （中文夹在中间说明是在讨论这个词，不是上游报错）。
     """
     s = (text or "").strip()
-    if not s:
+    if not s or len(s) > _GATEWAY_INTERRUPT_MAXLEN:
         return False
-    head = s[:200].lower().lstrip("\u26a0\ufe0f\u2049\u274c!? \t\r\n")
-    if head.startswith(_GATEWAY_INTERRUPT_MARKERS):
+    head = s.lower().lstrip("\u26a0\ufe0f\u2049\u274c!? \t\r\n")
+    for m in _GATEWAY_INTERRUPT_MARKERS:
+        if not head.startswith(m):
+            continue
+        if m == "api call failed" and _has_cjk(head[:40]):
+            continue
         return True
-    return any(m in head[:40] for m in _GATEWAY_INTERRUPT_MARKERS)
+    return False
 
 
 def _is_error_output(text):
@@ -576,7 +591,22 @@ def _gateway_chat(message, timeout=GATEWAY_CHAT_TIMEOUT, session=None):
                 log(f"⚠️ Gateway 返回回合中断提示（{session}）：{content[:60]!r}")
                 return None, "gateway turn interrupted"
             return content, None
-        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        except urllib.error.HTTPError as e:
+            # 404 = 会话已不存在（如 _maybe_reset_gateway_session 刚删掉主会话，
+            # 而 _ENSURED_GW_SESSIONS 缓存仍记着它 → ensure 被缓存短路没重建）。
+            # 网关不会自动建会话，必须自愈一次，否则此后每条消息都 404。
+            if e.code == 404 and attempt == 0:
+                log(f"♻️ 会话 {session} 不存在（404），重建后重试")
+                _ENSURED_GW_SESSIONS.discard(session)
+                _ensure_gateway_session(session)
+                continue
+            err = str(e)
+            if attempt == 0:
+                log(f"Gateway 请求失败 (重试): {err[:80]}")
+                time.sleep(2)
+                continue
+            return None, err
+        except urllib.error.URLError as e:
             err = str(e)
             if attempt == 0:
                 log(f"Gateway 请求失败 (重试): {err[:80]}")
@@ -586,6 +616,20 @@ def _gateway_chat(message, timeout=GATEWAY_CHAT_TIMEOUT, session=None):
         except Exception as e:
             return None, str(e)
     return None, "Gateway 失败（重试耗尽）"
+
+
+def _drop_gateway_session(session):
+    """删除一个临时会话并清掉存在性缓存（重试会话用完即弃，防止上下文累积）。"""
+    if not session or session == GATEWAY_SESSION:
+        return
+    try:
+        req = urllib.request.Request(f"{GATEWAY_URL}/api/sessions/{session}",
+                                     headers=_gateway_headers(), method="DELETE")
+        urllib.request.urlopen(req, timeout=20).close()
+    except Exception as e:
+        log(f"⚠️ 临时会话 {session} 删除失败: {str(e)[:60]}")
+    finally:
+        _ENSURED_GW_SESSIONS.discard(session)
 
 
 def _session_for_attempt(msg_id):
@@ -669,6 +713,9 @@ def _maybe_reset_gateway_session(force=False):
         req = urllib.request.Request(f"{GATEWAY_URL}/api/sessions/{GATEWAY_SESSION}",
                                      headers=_gateway_headers(), method="DELETE")
         urllib.request.urlopen(req, timeout=30).close()
+        # ⚠️ 必须清掉存在性缓存，否则下面 _ensure_gateway_session 会被缓存短路、
+        # 不真正重建（网关不会自动建会话）→ 此后每条消息 chat 都 404
+        _ENSURED_GW_SESSIONS.discard(GATEWAY_SESSION)
     except Exception as e:
         log(f"⚠️ 会话删除失败: {str(e)[:80]}")
     _ensure_gateway_session()
@@ -1511,10 +1558,15 @@ def process_messages():
             fail_kind = "llm"
 
             if _is_gateway_alive():
-                output, err = _gateway_chat(prompt, session=_session_for_attempt(mid_key))
+                used_session = _session_for_attempt(mid_key)
+                output, err = _gateway_chat(prompt, session=used_session)
                 if err is None and output is not None:
                     has_out = bool(output)
                     log(f"✅ {mid} 处理完成 (Gateway, {len(output) if has_out else 0} chars)")
+                    # 重试会话用完即弃：-r{n} 若留着会跨消息/跨主题累积上下文，
+                    # 等于把「会话只涨不缩 → 回合超时」原样搬到重试路径上
+                    if used_session != GATEWAY_SESSION:
+                        _drop_gateway_session(used_session)
                 else:
                     fail_why = f"Gateway 处理失败 ({err or 'no output'})"
                     fail_kind = "llm"       # 真调了 LLM 才失败 → 计次上限
