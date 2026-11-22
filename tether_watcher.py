@@ -230,8 +230,9 @@ def _is_gateway_interrupt(text):
     2026-11-20 mac review 实测，宽松分支会把
     「【mac】结论：…原文是 ⚠️ No reply: …」(214 字) 和「API call failed 这个词是…」(80 字)
     这类正常复盘判成失败 → 真答案重试 3 次后丢弃，比漏拦噪音更糟。
-    另加两条护栏：长度 ≤300；`api call failed` 只在前 40 字符无中文时才算中断文案
-    （中文夹在中间说明是在讨论这个词，不是上游报错）。
+    另加两条护栏：长度 ≤300；前 40 字符含中文即放行（真实中断文案恒为英文 ASCII，
+    中文夹在开头说明是在讨论这个前缀/词语，2026-11-20 实测「No reply: 已修复，是持久化
+    失败导致」这类复盘被误判 → 真答案重试 3 次后丢弃，代价远大于漏拦一条噪音）。
     """
     s = (text or "").strip()
     if not s or len(s) > _GATEWAY_INTERRUPT_MAXLEN:
@@ -240,7 +241,7 @@ def _is_gateway_interrupt(text):
     for m in _GATEWAY_INTERRUPT_MARKERS:
         if not head.startswith(m):
             continue
-        if m == "api call failed" and _has_cjk(head[:40]):
+        if _has_cjk(head[:40]):
             continue
         return True
     return False
