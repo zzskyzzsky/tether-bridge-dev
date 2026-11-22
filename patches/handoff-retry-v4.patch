@@ -1,0 +1,290 @@
+diff --git a/tether_server.py b/tether_server.py
+index 8736215..71f7f51 100644
+--- a/tether_server.py
++++ b/tether_server.py
+@@ -117,8 +117,11 @@ def receive():
+     elif msg_type == "handoff":
+         # handoff：存 SQLite + 写 handoff 文件，不触发 Watcher notify
+         # watcher 在主轮询中独立检查 handoff 文件
++        # P2-a（mac review v4）：必须原子写。watcher 侧已改 tmp+os.replace，但本进程
++        # 是独立进程，非原子写在跨进程场景下仍会被 watcher 读到半截 JSON。
+         try:
+-            with open(HANDOFF_FILE, "w") as f:
++            _tmp = HANDOFF_FILE + ".tmp"
++            with open(_tmp, "w") as f:
+                 json.dump({
+                     "msg_id": msg_id,
+                     "sender": sender,
+@@ -127,6 +130,7 @@ def receive():
+                     "summary": content,
+                     "timestamp": _now(),
+                 }, f)
++            os.replace(_tmp, HANDOFF_FILE)
+         except Exception:
+             pass
+     else:
+diff --git a/tether_watcher.py b/tether_watcher.py
+index 3c6e142..9fc5b43 100644
+--- a/tether_watcher.py
++++ b/tether_watcher.py
+@@ -278,6 +278,18 @@ _HANDOFF_TIMEOUT_CACHE = {}  # outgoing_msg_id -> timestamp
+ _HANDOFF_TIMEOUT_MINUTES = 15  # 默认15分钟（之前5分钟，通知太频繁）
+ _HANDOFF_TIMEOUT_COOLDOWN = 600  # 10分钟内不重复唤醒同一消息
+ 
++# handoff 在途登记（2026-11-20 mac review P1-1）：一条 handoff 失败后进入 60s 退避，
++# 期间若对端又来一条 handoff，主循环处理完它 → _recover_next_handoff 会把**正在退避的
++# 同一条**重新捞出来写文件，与仍在跑的 Timer 并发执行同一 msg_id（重复 LLM + 重复回发）。
++# 登记表用于让 _recover_next_handoff 跳过在途 id；TTL 防泄漏卡死队列。
++_HANDOFF_INFLIGHT = {}  # msg_id -> 登记时间戳
++_HANDOFF_INFLIGHT_TTL = 900  # 15 分钟未清除视为陈旧，自动失效
++
++# 兜底恢复节流（mac review P2b）：process_handoffs 每 2s 跑一次，稳态下不能让每次
++# 都做一次 SELECT（还会顺带写文件）；启动兜底已由 _recover_stale_handoffs 覆盖。
++_LAST_RECOVER_TS = 0.0
++_HANDOFF_RECOVER_MIN_INTERVAL = 30.0
++
+ # OOM 自愈计数器：按 msg_id 跟踪连续 OOM
+ _OOM_COUNTER = {}  # {msg_id: [count, timestamp]}
+ _OOM_WINDOW = 300  # 5分钟窗口，超时重置
+@@ -1661,12 +1673,27 @@ def process_handoffs():
+     处理完成后自动回复到发送方。
+     """
+     if not os.path.isfile(HANDOFF_FILE):
++        # P2-1 兜底（mac review）：Timer 重试在 watcher 重启后蒸发，消息 acked=0 但
++        # 盘上没有 handoff 文件，主循环不会主动捞。main 启动时的 _recover_stale_handoffs
++        # 已覆盖大部分情况，这里再幂等兜一次 —— 但要节流（P2b），否则每 2s 一次 SELECT。
++        if __import__("time").time() - _LAST_RECOVER_TS > _HANDOFF_RECOVER_MIN_INTERVAL:
++            _recover_next_handoff()
+         return
+ 
+     try:
+         with open(HANDOFF_FILE) as f:
+             handoff = json.load(f)
+     except (json.JSONDecodeError, OSError):
++        # P2-b（mac review v4）：坏文件无自愈。原实现只 return，而文件一直在，
++        # 于是每个 tick 都解析失败 → 该条永久卡死（旧版 server 非原子写也会产生半截文件）。
++        # mtime > 5s 说明不是「正在写」的瞬时半截，删除并让 _recover_next_handoff 从库里重捞。
++        try:
++            if __import__("time").time() - os.path.getmtime(HANDOFF_FILE) > 5:
++                log("🗑 检测到损坏的 handoff 文件（>5s 未更新），删除并重新从库恢复")
++                os.remove(HANDOFF_FILE)
++                _recover_next_handoff()
++        except OSError:
++            pass
+         return
+ 
+     sender = handoff.get("sender", "")
+@@ -1712,42 +1739,103 @@ def process_handoffs():
+     )
+ 
+     # 子线程调用 Gateway API，不阻塞主循环
+-    def _run_handoff(sender=sender, msg_id=msg_id):
++    def _run_handoff(sender=sender, msg_id=msg_id, _attempt=0):
++        """单条 handoff 的一次尝试；_attempt = 已失败次数（0 = 首发）。
++
++        重试策略：失败按 _ACK_RETRY_BACKOFF(60s) 退避，共尝试 _ACK_MAX_ATTEMPTS(3) 次
++        （首发 + 2 次重试），超限才 _ack_handoff + 告警主人。语义按"总尝试次数"计。
++        """
+         output = None
++        error = None
++        # P1-2：重试不复用主会话，否则与仍在跑的旧回合抢 session → 又是 turn was stopped，
++        # 正好是本补丁要修的症状；info 路径已有 _session_for_attempt 轮换，这里照抄语义。
++        # ⚠️ v3（mac review 阻断项）：会话名不能与 info 的 -r{n} 撞车。退避期会推进队列，
++        # 两条 handoff 可并跑，若都用 -r1 会上下文混串 + 互相顶回合。故用独立 h 前缀 + msg_id。
++        # 并发度：最多 2 条 LLM 并跑（主循环一条 + 重试会话一条），mac 内存预算可承受（已确认）。
++        used_session = (GATEWAY_SESSION if _attempt <= 0
++                        else f"{GATEWAY_SESSION}-h{_attempt}-{msg_id[:6]}")
++        # P1-1：在途登记。退避期间**保留**登记（retry_scheduled=True 不清），
++        # 防 _recover_next_handoff 把正在退避的同一条再捞出来并发执行。
++        _HANDOFF_INFLIGHT[msg_id] = __import__("time").time()
++        retry_scheduled = False
+         try:
+-            output, error = _gateway_chat(prompt)
+-            if output:
+-                log(f"✅ Handoff 处理完成 ({len(output)} chars)")
+-                _write_handoff_result(sender, summary[:40], output[:500])
+-            else:
+-                log(f"⚠️ Handoff Gateway 无输出: {error[:80] if error else 'unknown'}")
+-        except Exception as e:
+-            log(f"❌ Handoff 异常: {str(e)[:80]}")
+-
+-        # Handoff 处理结果：Report 走通知，其余 auto-reply 回发送方
+-        if output and sender:
+-            is_report = _should_report(output)
+-            if is_report:
+-                log(f"🔔 Handoff [{msg_id[:8]}] 标记为 Report → 走通知")
+-                # 同 :948 分支，必须走 _send_notification 才认飞书 hook
+-                _send_notification(output)
+-
+-            # ⚠️ 替换为短 ack 的条件必须收窄到**显式 [REPORT] 前缀**（2026-09-10 review）。
+-            # handoff 的 prompt 明确要求"给主人的最终报告"首行写 [REPORT]；而
+-            # _should_report 的关键词（如"测试通过"）会被对端的分析回复误命中
+-            # → 对端只收到"已处理"、丢掉实质结论 = 链路断（尤其 mac 是接收方时）。
+-            # 非显式标记 → 仍发全文，保证闭环；报告类内容也不会外泄给对端。
+-            if output.startswith("[REPORT]"):
+-                _auto_reply(f"✅ 已处理 handoff #{msg_id[:8]}，报告已发主人。", sender, msg_id)
+-            else:
+-                # 所有消息都 auto-reply 回发送方
+-                _auto_reply(output, sender, msg_id)
++            try:
++                output, error = _gateway_chat(prompt, session=used_session)
++                if output:
++                    # P2-c（mac review v4）：与 info 路径一致，只在成功分支清会话。
++                    # 超时/中断时该会话里可能仍有回合在跑，提前删会让它报 404 并丢答案。
++                    if used_session != GATEWAY_SESSION:
++                        _drop_gateway_session(used_session)
++                    log(f"✅ Handoff 处理完成 ({len(output)} chars, session={used_session})")
++                    try:
++                        _write_handoff_result(sender, summary[:40], output[:500])
++                    except Exception as e:
++                        # P2-2：答案已经拿到，落盘失败不能判成回合失败，否则同一答案回发两次
++                        log(f"⚠️ Handoff 结果落盘失败（不影响回发）: {str(e)[:60]}")
++                else:
++                    log(f"⚠️ Handoff Gateway 无输出: {error[:80] if error else 'unknown'}")
++            except Exception as e:
++                # P2-2：只有还没拿到答案时才按失败处理
++                if not output:
++                    error = f"exception: {e}"
++                log(f"❌ Handoff 异常: {str(e)[:80]}")
+ 
+-        # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
+-        _ack_handoff(msg_id)
++            # Handoff 处理结果：Report 走通知，其余 auto-reply 回发送方
++            if output and sender:
++                is_report = _should_report(output)
++                if is_report:
++                    log(f"🔔 Handoff [{msg_id[:8]}] 标记为 Report → 走通知")
++                    # 同 :948 分支，必须走 _send_notification 才认飞书 hook
++                    _send_notification(output)
+ 
+-        # 处理完一条后尝试恢复下一条积压 handoff
+-        _recover_next_handoff()
++                # ⚠️ 替换为短 ack 的条件必须收窄到**显式 [REPORT] 前缀**（2026-09-10 review）。
++                # handoff 的 prompt 明确要求"给主人的最终报告"首行写 [REPORT]；而
++                # _should_report 的关键词（如"测试通过"）会被对端的分析回复误命中
++                # → 对端只收到"已处理"、丢掉实质结论 = 链路断（尤其 mac 是接收方时）。
++                # 非显式标记 → 仍发全文，保证闭环；报告类内容也不会外泄给对端。
++                if output.startswith("[REPORT]"):
++                    _auto_reply(f"✅ 已处理 handoff #{msg_id[:8]}，报告已发主人。", sender, msg_id)
++                else:
++                    # 所有消息都 auto-reply 回发送方
++                    _auto_reply(output, sender, msg_id)
++
++            # ⚠️ 失败不得无条件 ack（2026-11-20 mac review 指出）：原实现无论成败都
++            # _ack_handoff → 超时/回合中断时消息直接标已读、不进重试、真答案静默丢失。
++            # 判据用 error 而不是 output：prompt 明确允许"无实质内容时输出空文本"，
++            # output 空 + error is None 是合法静默，必须照常 ack。
++            if error:
++                attempts = _attempt + 1
++                if attempts >= _ACK_MAX_ATTEMPTS:
++                    _ack_handoff(msg_id)
++                    log(f"🚫 Handoff {msg_id[:8]} 连续失败 {attempts} 次，放弃并标记（{error[:60]}）")
++                    try:
++                        _send_notification(
++                            f"🚫 Tether handoff 重试 {attempts} 次仍失败，已置 acked=1"
++                            f"（原文保留在 tether.db 可回查）。原因：{error[:200]}"
++                        )
++                    except Exception as e:
++                        log(f"⚠️ Handoff 放弃告警异常: {str(e)[:60]}")
++                else:
++                    log(f"↻ Handoff {msg_id[:8]} 失败 {attempts}/{_ACK_MAX_ATTEMPTS}，"
++                        f"{int(_ACK_RETRY_BACKOFF)}s 后重试（{error[:60]}）")
++                    retry_scheduled = True
++                    threading.Timer(
++                        _ACK_RETRY_BACKOFF,
++                        lambda: _run_handoff(sender, msg_id, attempts),
++                    ).start()
++                # P3：退避期间不再把队列压住 —— 在途登记已能防止重复捞取，
++                # 这里继续推进下一条 handoff，不必等本条 60s 退避结束。
++                _recover_next_handoff()
++                return
++
++            # 标记本消息为已确认，防止 _recover_next_handoff 再次恢复同一消息
++            _ack_handoff(msg_id)
++
++            # 处理完一条后尝试恢复下一条积压 handoff
++            _recover_next_handoff()
++        finally:
++            if not retry_scheduled:
++                _HANDOFF_INFLIGHT.pop(msg_id, None)
+ 
+     t = threading.Thread(target=_run_handoff, daemon=True)
+     t.start()
+@@ -1971,29 +2059,52 @@ def _ack_handoff(msg_id):
+         log(f"⚠️ 标记 handoff acked 失败: {str(e)[:60]}")
+ 
+ 
++def _write_handoff_file(msg_id, sender, message):
++    """原子写 HANDOFF_FILE（mac review P2）：主循环/定时器/子线程会并发写同一个文件，
++    直接 open(w)+dump 会被读到半截 JSON，而 process_handoffs 的 JSONDecodeError 分支
++    只 return 不删文件 → 该条永久解析失败。先写 .tmp 再 os.replace 保证原子性。"""
++    tmp = HANDOFF_FILE + ".tmp"
++    payload = {
++        "msg_id": msg_id,
++        "sender": sender,
++        "summary": message,
++        "timestamp": __import__("datetime").datetime.now().isoformat(),
++    }
++    with open(tmp, "w") as f:
++        json.dump(payload, f)
++    os.replace(tmp, HANDOFF_FILE)
++
++
+ def _recover_next_handoff():
+     """从 SQLite 中取下一个未处理的 handoff，写入 handoff 文件"""
++    global _LAST_RECOVER_TS
++    _LAST_RECOVER_TS = __import__("time").time()
+     try:
+         import sqlite3
+         db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+         if not os.path.isfile(db_path):
+             return
+         conn = sqlite3.connect(db_path, timeout=3)
+-        row = conn.execute(
+-            "SELECT id, sender, message FROM messages WHERE acked=0 AND type='handoff' LIMIT 1"
+-        ).fetchone()
++        rows = conn.execute(
++            "SELECT id, sender, message FROM messages WHERE acked=0 AND type='handoff' "
++            "ORDER BY received_at LIMIT 10"
++        ).fetchall()
+         conn.close()
++        if not rows:
++            return
++        # ⚠️ 跳过在途消息（P1-1）：正在跑/正在退避的 msg_id 不能被重新捞出来并发执行
++        import time as _t
++        now = _t.time()
++        for k, v in list(_HANDOFF_INFLIGHT.items()):
++            if now - v > _HANDOFF_INFLIGHT_TTL:
++                _HANDOFF_INFLIGHT.pop(k, None)
++                log(f"⏲ handoff 在途登记超时清除 {k[:8]}")
++        row = next((r for r in rows if r[0] not in _HANDOFF_INFLIGHT), None)
+         if not row:
+             return
+         msg_id, sender, message = row
+         log(f"♻️ 恢复下一条 handoff #{msg_id[:8]} from={sender}")
+-        with open(HANDOFF_FILE, "w") as f:
+-            json.dump({
+-                "msg_id": msg_id,
+-                "sender": sender,
+-                "summary": message,
+-                "timestamp": __import__("datetime").datetime.now().isoformat(),
+-            }, f)
++        _write_handoff_file(msg_id, sender, message)
+     except Exception as e:
+         log(f"handoff 恢复异常: {str(e)[:60]}")
+ 
+@@ -2015,13 +2126,7 @@ def _recover_stale_handoffs():
+         for row in rows:
+             msg_id, sender, message = row
+             log(f"♻️ 发现未处理的 handoff #{msg_id[:8]} from={sender}，重新生成 handoff 文件")
+-            with open(HANDOFF_FILE, "w") as f:
+-                json.dump({
+-                    "msg_id": msg_id,
+-                    "sender": sender,
+-                    "summary": message,
+-                    "timestamp": __import__("datetime").datetime.now().isoformat(),
+-                }, f)
++            _write_handoff_file(msg_id, sender, message)
+             # 只恢复第一条，后续靠子线程链式推进
+             break
+     except Exception as e:
