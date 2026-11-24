@@ -168,8 +168,9 @@ def migrate(path, apply_, drop, check=False):
     except Exception as e:
         log(f"❌ 迁移失败（{e}），开始还原备份 {bak}")
         conn.close()
-        restore(bak, path)
-        return 1
+        if not restore(bak, path):
+            return 2   # 失败且还原也失败：现场状态不明，必须人工
+        return 1       # 失败但已成功还原：现场已知，可安全重试
     finally:
         try:
             conn.close()
@@ -185,8 +186,9 @@ def migrate(path, apply_, drop, check=False):
     ok = after_ic == "ok" and after_counts == before_counts
     if not ok:
         log("❌ 验收不通过（integrity 或行数不一致），开始还原备份")
-        restore(bak, path)
-        return 1
+        if not restore(bak, path):
+            return 2   # 失败且还原也失败：现场状态不明，必须人工
+        return 1       # 失败但已成功还原
     log(f"✅ 验收通过（integrity=ok，行数与迁移前一致）备份留存：{bak}")
     return 0
 

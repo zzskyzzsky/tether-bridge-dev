@@ -983,11 +983,14 @@ def _opener_for(peer_url):
     return _DEFAULT_OPENER
 
 
-def _try_post(peer_url, payload, timeout=10):
+def _try_post(peer_url, payload, timeout=10, extra_headers=None):
     """尝试 POST 到指定 URL，返回 (success, error_msg)"""
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
     try:
         req = urllib.request.Request(peer_url, data=payload,
-                                     headers={"Content-Type": "application/json"})
+                                     headers=headers)
         with _opener_for(peer_url).open(req, timeout=timeout):
             return True, None
     except Exception as e:
@@ -1040,6 +1043,74 @@ def _is_skip_noise(content):
     if c in _SKIP_EXACT_CONFIRMATIONS:
         return True
     return len(c) <= _SKIP_CONTAINS_MAX_LEN and any(k in c for k in _SKIP_CONTAINS_KEYWORDS)
+
+
+def _auto_reply_peer_key(target_host):
+    """逻辑对端身份。relay 会把报文 sender 改写成中继 IP，按 target_host 计数会把
+    同一个对端拆成 relay/直连两个 key（上限被翻倍），所以优先用配置的 TETHER_PEER_KEY。"""
+    return (os.environ.get("TETHER_PEER_KEY", "").strip()
+            or PEER_HOST or target_host or "unknown")
+
+
+def _auto_reply_gate(peer_key):
+    """出站成本闸：auto-reply 每对端每小时上限（默认 30）。
+
+    为什么需要它：内容去重挡不住「措辞每轮不同的回声」——第二轮起是 LLM 重新生成的，
+    哈希无效。这一条与内容无关，把最坏成本钉死。计数必须落库，否则重启即清零等于可刷。
+    返回 (allowed, count, cap)。
+    """
+    import sqlite3
+    cap = int(os.environ.get("TETHER_AUTO_REPLY_HOURLY_CAP", "30"))
+    now = time.time()
+    db_path = os.environ.get("TETHER_DB_PATH") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "tether.db")
+    try:
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.execute("CREATE TABLE IF NOT EXISTS auto_reply_log (ts REAL NOT NULL, peer TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS auto_reply_notice (peer TEXT PRIMARY KEY, ts REAL NOT NULL)")
+        conn.execute("DELETE FROM auto_reply_log WHERE ts < ?", (now - 7200,))
+        n = conn.execute(
+            "SELECT COUNT(*) FROM auto_reply_log WHERE peer=? AND ts>?", (peer_key, now - 3600)
+        ).fetchone()[0]
+        if n < cap:
+            conn.commit()
+            conn.close()
+            return True, n, cap
+        # 触顶：每小时只通知主人一次
+        last = conn.execute("SELECT ts FROM auto_reply_notice WHERE peer=?", (peer_key,)).fetchone()
+        if not last or now - last[0] > 3600:
+            conn.execute("INSERT INTO auto_reply_notice (peer,ts) VALUES (?,?) "
+                         "ON CONFLICT(peer) DO UPDATE SET ts=excluded.ts", (peer_key, now))
+            conn.commit()
+            conn.close()
+            _send_notification(
+                f"[tp] tether auto-reply 触顶：对端 {peer_key} 近 1 小时已发 {n} 条"
+                f"（上限 {cap}），本小时不再自动回复对端。\n"
+                "含义：要么确有大量实质往返，要么出现了措辞每轮不同的回声链。\n"
+                "需要你做的：无（下一小时自动恢复）；若确认是死循环，回一句我就把上限降到 6。")
+            log(f"🛑 auto-reply 触顶：peer={peer_key} count={n} cap={cap}，已通知主人")
+            return False, n, cap
+        conn.commit()
+        conn.close()
+        return False, n, cap
+    except Exception as e:
+        log(f"⚠️ auto-reply 计数失败（放行）：{e}")
+        return True, 0, cap
+
+
+def _auto_reply_record(peer_key):
+    """成功出站后记账（跨重启保持）。"""
+    import sqlite3
+    try:
+        db_path = os.environ.get("TETHER_DB_PATH") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.execute("CREATE TABLE IF NOT EXISTS auto_reply_log (ts REAL NOT NULL, peer TEXT NOT NULL)")
+        conn.execute("INSERT INTO auto_reply_log (ts, peer) VALUES (?,?)", (time.time(), peer_key))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"⚠️ auto-reply 记账失败：{e}")
 
 
 def _auto_reply(output, sender_info, original_msg_id=None):
@@ -1130,14 +1201,22 @@ def _auto_reply(output, sender_info, original_msg_id=None):
     except Exception:
         pass
 
+    # 成本闸（与内容无关）：先查，超限直接不发。见 _auto_reply_gate。
+    peer_key = _auto_reply_peer_key(target_host)
+    allowed, ar_count, ar_cap = _auto_reply_gate(peer_key)
+    if not allowed:
+        return
+
     payload = json.dumps({
         "from": f"{hostname} ({sender_nick})",
         "sender": f"{hostname} ({sender_nick})",
         "message": reply_text,
         "content": reply_text,
         "type": "info",       # 改 info 让对端 watcher 可见
-        "is_reply": True,     # 标记为回复消息，对端跳过 auto-reply-back 防回环
-        "ttl": 1,
+        # ⚠️ is_reply 在 server 侧不存在（get_messages 的 SELECT 不含它），对端读不到，
+        # 防不了回环；真正兜底的是对端收件去重 + 本侧 _auto_reply_gate 成本闸。
+        "is_reply": True,
+        "ttl": 1,             # 仅诊断：写下跳数，两端都不做判断
     }).encode()
 
     # 如果有 original_msg_id，payload 中带 in_reply_to 字段
@@ -1151,14 +1230,19 @@ def _auto_reply(output, sender_info, original_msg_id=None):
     last_err_msg = ""
     for i, candidate in enumerate(candidates):
         peer_url = f"http://{candidate}:{PEER_PORT}/message"
-        ok, err = _try_post(peer_url, payload)
+        # 头用来让对端选 600 秒去重窗（auto-reply 才用长窗，普通消息 120 秒）
+        ok, err = _try_post(peer_url, payload,
+                            extra_headers={"X-Tether-Auto-Reply": "1"})
         if ok:
             used = "主路径" if i == 0 else f"回退路径（前次失败: {last_err_msg}）"
-            log(f"📤 自动回复 {len(reply_text)} chars 到 {candidate}（{used}）")
+            log(f"📤 自动回复 {len(reply_text)} chars 到 {candidate}（{used}，"
+                f"本小时 {ar_count + 1}/{ar_cap}）")
+            _auto_reply_record(peer_key)
             # 记录到 outgoing_messages
             try:
                 import sqlite3
-                db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+                db_path = os.environ.get("TETHER_DB_PATH") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tether.db")
                 conn = sqlite3.connect(db_path, timeout=3)
                 conn.execute(
                     "INSERT OR IGNORE INTO outgoing_messages (id, target_host, sender, message, sent_at, acked) VALUES (?,?,?,?,?,1)",

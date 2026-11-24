@@ -4,7 +4,7 @@ Tether Server v3 — 极简消息中转
 只做三件事：收消息、存 SQLite、写通知文件。
 支持 type=handoff 消息：存 SQLite + 写 handoff 文件，但不触发 Watcher。
 """
-import json, os, socket, sqlite3, time, uuid
+import json, os, socket, sqlite3, time, uuid, hashlib
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
@@ -13,7 +13,15 @@ app = Flask(__name__)
 
 HOSTNAME = socket.gethostname()
 LISTEN_PORT = 9003
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+# DB_PATH 可用环境变量覆盖（仅测试用；生产走默认路径）
+DB_PATH = os.environ.get("TETHER_DB_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tether.db")
+# 逻辑对端身份：relay 会把 sender 统一改写成中继 IP，报文里的 sender 不可用来判作者/去重，
+# 只能由配置给出（两端一致）。未配置时退化为报文 sender。
+PEER_KEY = os.environ.get("TETHER_PEER_KEY", "").strip()
+# 去重窗：普通 120 秒；watcher 出站 auto-reply 自带 X-Tether-Auto-Reply: 1 → 600 秒
+DEDUP_WINDOW_DEFAULT = 120
+DEDUP_WINDOW_AUTO_REPLY = 600
 NOTIFY_FILE = "/tmp/tether_notify.json"
 HANDOFF_FILE = "/tmp/tether_handoff.json"
 HEARTBEAT_FILE = "/tmp/tether_watcher_heartbeat.json"
@@ -38,6 +46,15 @@ def _db():
         id TEXT PRIMARY KEY, target_host TEXT NOT NULL,
         sender TEXT NOT NULL, message TEXT NOT NULL,
         sent_at TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0
+    )""")
+    # 收件口去重状态（v3.13）：key = sha256(peer|content)，见 receive()
+    conn.execute("""CREATE TABLE IF NOT EXISTS dedup_seen (
+        key TEXT PRIMARY KEY, ts REAL NOT NULL, window_s INTEGER NOT NULL
+    )""")
+    # 去重命中诊断（600 秒窗命中必须留痕，否则没人知道长窗吞没吞正常消息）
+    conn.execute("""CREATE TABLE IF NOT EXISTS dedup_log (
+        ts REAL NOT NULL, key TEXT NOT NULL, window_s INTEGER NOT NULL,
+        action TEXT NOT NULL, preview TEXT
     )""")
     return conn
 
@@ -111,6 +128,34 @@ def receive():
     if not content.strip():
         return jsonify({"status": "ok", "dropped": "empty"})
 
+    # ── 收件口内容去重（v3.13）─────────────────────────────────────────
+    # 目的：吃掉 tether_send 重试（同内容、不同 uuid）与逐字重发的连发。
+    # 键 = sha256(peer|content)：peer 由配置给出（relay 会把报文 sender 改写成中继 IP，
+    # 用它做键等于只按内容哈希）。窗口两档：auto-reply 600 秒，其余 120 秒，头缺失取短。
+    # ⚠️ 这条挡不住「措辞每轮不同的回声」——那由 watcher 出站成本闸兜底。
+    is_auto_reply = (request.headers.get("X-Tether-Auto-Reply", "").strip() == "1")
+    window_s = DEDUP_WINDOW_AUTO_REPLY if is_auto_reply else DEDUP_WINDOW_DEFAULT
+    peer = PEER_KEY or sender
+    dkey = hashlib.sha256(f"{peer}|{content}".encode("utf-8", errors="replace")).hexdigest()
+    now_ts = time.time()
+    with _db_conn() as conn:
+        # 顺手清掉过期状态，表不会无限长
+        conn.execute("DELETE FROM dedup_seen WHERE ts < ?", (now_ts - 3600,))
+        row = conn.execute("SELECT ts, window_s FROM dedup_seen WHERE key=?", (dkey,)).fetchone()
+        hit = bool(row) and (now_ts - row["ts"] <= max(row["window_s"], window_s))
+        if hit:
+            conn.execute(
+                "INSERT INTO dedup_log (ts,key,window_s,action,preview) VALUES (?,?,?,?,?)",
+                (now_ts, dkey, window_s, "dropped",
+                 content.replace("\n", " ")[:40]))
+        else:
+            conn.execute(
+                "INSERT INTO dedup_seen (key,ts,window_s) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET ts=excluded.ts, window_s=excluded.window_s",
+                (dkey, now_ts, window_s))
+    if hit:
+        return jsonify({"status": "ok", "dropped": "dup", "window_s": window_s})
+
     msg_id = str(uuid.uuid4())
     with _db_conn() as conn:
         conn.execute(
@@ -149,18 +194,26 @@ def receive():
         _write_notify(content, cnt)
     return jsonify({"status": "ok", "message_id": msg_id})
 
+def _has_ttl(conn):
+    """ttl 列由 scripts/migrate_origin_ttl.py 加，迁移前后都要能跑。"""
+    return any(r[1] == "ttl" for r in conn.execute("PRAGMA table_info(messages)"))
+
+
 @app.route("/messages", methods=["GET"])
 def get_messages():
     auto_ack = request.args.get("ack", "1") == "1"
     msg_type = request.args.get("type", "info")  # 默认只返回 info 消息，传 all 返回全部
     with _db_conn() as conn:
+        # ttl 是诊断列，必须原样返回给对端（迁移未跑时自动降级为不返回）
+        cols = "id,sender,message,type,received_at,ttl" if _has_ttl(conn) \
+            else "id,sender,message,type,received_at"
         if msg_type == "all":
             rows = conn.execute(
-                "SELECT id,sender,message,type,received_at FROM messages WHERE acked=0"
+                f"SELECT {cols} FROM messages WHERE acked=0"
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id,sender,message,type,received_at FROM messages WHERE acked=0 AND type=?",
+                f"SELECT {cols} FROM messages WHERE acked=0 AND type=?",
                 (msg_type,)
             ).fetchall()
         if auto_ack and rows:

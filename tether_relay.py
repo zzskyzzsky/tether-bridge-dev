@@ -175,9 +175,9 @@ def receive():
     data["from"] = RELAY_SENDER
     if "from_nick" in data:
         data["from_nick"] = "relay"
-    # TTL 防死循环：relay 转发时设置 ttl=1，对端 watcher 收到后 TTL-1
-    # 若 TTL=0 则停止转发，避免消息循环
-    data["ttl"] = 1
+    # ttl 只作诊断（不做闸门）：已经有 ttl 就保留下游的值，缺失才补 1。
+    # 旧实现无条件覆盖为 1，会抹平上游跳数，诊断信息就没了。
+    data.setdefault("ttl", 1)
 
     with _db() as conn:
         conn.execute(
