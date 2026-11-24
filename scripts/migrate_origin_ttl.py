@@ -39,7 +39,9 @@ TABLE = "messages"
 NEW_COLUMNS = [
     # (列名, 定义) —— origin 用空串默认值，兼容老 relay 不传字段
     ("origin", "TEXT NOT NULL DEFAULT ''"),
-    ("ttl", "INTEGER NOT NULL DEFAULT 1"),
+    # P1': 不用 DEFAULT 1 —— 直发链路不带 ttl，历史行不该长得像「第一跳」；
+    # NULL 才能区分「未参与防环计数」与「计数到 1」
+    ("ttl", "INTEGER"),
 ]
 TIMEOUT = 5
 RETRIES = 6
@@ -101,12 +103,22 @@ def integrity(path):
 
 
 def backup(src):
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dst = f"{src}.bak-{ts}"
+    """备份到唯一文件名。P1: 秒级命名会在同秒内先 apply 再 rollback 时
+    静默覆盖掉「迁移前」备份，让「失败自动还原」这条退路失效。"""
+    base = f"{src}.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{datetime.now().microsecond:06d}"
+    dst, n = base, 0
+    while True:
+        try:
+            fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+            break
+        except FileExistsError:
+            n += 1
+            dst = f"{base}-{n}"
     s = connect(src)
     d = sqlite3.connect(dst)
     try:
-        s.backup(d)
+        with_retry(lambda: s.backup(d), "备份")
     finally:
         d.close()
         s.close()
@@ -114,7 +126,7 @@ def backup(src):
     return dst
 
 
-def migrate(path, apply_, drop):
+def migrate(path, apply_, drop, check=False):
     before_cols = columns(path)
     before_counts = counts(path)
     before_ic = integrity(path)
@@ -141,6 +153,9 @@ def migrate(path, apply_, drop):
         log(("将执行" if apply_ else "dry-run") + f"：{sql}")
 
     if not apply_:
+        if check:
+            log("--check：存在待执行变更")
+            return 3
         log("dry-run 结束，未改动任何数据。加 --apply 才真正执行")
         return 0
 
@@ -177,11 +192,17 @@ def migrate(path, apply_, drop):
 
 
 def restore(bak, path):
+    """P2: 窗口期 watcher 抢锁会让 backup() 抛 OperationalError；
+    必须重试并把失败说清楚，否则现场状态不明却像回滚成功。"""
     s = sqlite3.connect(bak)
     d = connect(path)
     try:
-        s.backup(d)
+        with_retry(lambda: s.backup(d), "还原")
         log(f"已从备份还原：{bak} → {path}")
+        return True
+    except Exception as e:
+        log(f"❌❌ 还原失败（{e}）。现场状态不明，手工用此路径还原：{bak}")
+        return False
     finally:
         d.close()
         s.close()
@@ -192,11 +213,12 @@ def main():
     ap.add_argument("--db", default=os.path.expanduser("~/.hermes/tether/tether.db"))
     ap.add_argument("--apply", action="store_true", help="真正执行（默认 dry-run）")
     ap.add_argument("--rollback", action="store_true", help="DROP 掉本迁移新增的列")
+    ap.add_argument("--check", action="store_true", help="只检查：有待执行变更时退出码 3")
     a = ap.parse_args()
     if not os.path.exists(a.db):
         log(f"库不存在：{a.db}")
         return 1
-    return migrate(a.db, a.apply, a.rollback)
+    return migrate(a.db, a.apply, a.rollback, a.check)
 
 
 if __name__ == "__main__":
