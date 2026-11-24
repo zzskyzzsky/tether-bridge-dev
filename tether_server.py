@@ -16,9 +16,10 @@ LISTEN_PORT = 9003
 # DB_PATH 可用环境变量覆盖（仅测试用；生产走默认路径）
 DB_PATH = os.environ.get("TETHER_DB_PATH") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tether.db")
-# 逻辑对端身份：relay 会把 sender 统一改写成中继 IP，报文里的 sender 不可用来判作者/去重，
-# 只能由配置给出（两端一致）。未配置时退化为报文 sender。
-PEER_KEY = os.environ.get("TETHER_PEER_KEY", "").strip()
+# 逻辑对端身份：relay 会把 sender 统一改写成中继 IP，报文里的 sender 不可用来去重
+# （同一内容经 relay 与直连进来 sender 不同 → 去重直接失效）。只能由配置给出（两端一致）。
+# 未配置时退化为固定串而不是 sender：宁可所有人共用一个键，也不要让去重静默失效。
+PEER_KEY = os.environ.get("TETHER_PEER_KEY", "").strip() or "peer"
 # 去重窗：普通 120 秒；watcher 出站 auto-reply 自带 X-Tether-Auto-Reply: 1 → 600 秒
 DEDUP_WINDOW_DEFAULT = 120
 DEDUP_WINDOW_AUTO_REPLY = 600
@@ -135,14 +136,19 @@ def receive():
     # ⚠️ 这条挡不住「措辞每轮不同的回声」——那由 watcher 出站成本闸兜底。
     is_auto_reply = (request.headers.get("X-Tether-Auto-Reply", "").strip() == "1")
     window_s = DEDUP_WINDOW_AUTO_REPLY if is_auto_reply else DEDUP_WINDOW_DEFAULT
-    peer = PEER_KEY or sender
-    dkey = hashlib.sha256(f"{peer}|{content}".encode("utf-8", errors="replace")).hexdigest()
+    dkey = hashlib.sha256(f"{PEER_KEY}|{content}".encode("utf-8", errors="replace")).hexdigest()
     now_ts = time.time()
     with _db_conn() as conn:
         # 顺手清掉过期状态，表不会无限长
         conn.execute("DELETE FROM dedup_seen WHERE ts < ?", (now_ts - 3600,))
         row = conn.execute("SELECT ts, window_s FROM dedup_seen WHERE key=?", (dkey,)).fetchone()
-        hit = bool(row) and (now_ts - row["ts"] <= max(row["window_s"], window_s))
+        # ⚠️ 不能取 max(已存, 本次)：先到一条 auto-reply（按 600 秒存），之后 10 分钟内来一条
+        # 同内容的普通消息会被长窗反向吞掉。只有「本次也是 auto-reply 且已存记录也是长窗」
+        # 才用 600，否则一律按 120。
+        eff_window = (DEDUP_WINDOW_AUTO_REPLY
+                      if (is_auto_reply and row and row["window_s"] >= DEDUP_WINDOW_AUTO_REPLY)
+                      else DEDUP_WINDOW_DEFAULT)
+        hit = bool(row) and (now_ts - row["ts"] <= eff_window)
         if hit:
             conn.execute(
                 "INSERT INTO dedup_log (ts,key,window_s,action,preview) VALUES (?,?,?,?,?)",

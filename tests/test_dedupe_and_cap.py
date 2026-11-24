@@ -8,6 +8,7 @@ import json, os, subprocess, sqlite3, sys, tempfile, time, urllib.request, urlli
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORT = 19003
+os.environ["TETHER_NOTIFY_DISABLE"] = "1"   # 绝不能真发通知到主人通道
 TMPDB = os.path.join(tempfile.mkdtemp(prefix="tether_dedupe_"), "t.db")
 BASE = f"http://127.0.0.1:{PORT}"
 fails = []
@@ -44,7 +45,8 @@ def aged(key_prefix_len=0, seconds=0):
 
 
 def main():
-    env = dict(os.environ, TETHER_DB_PATH=TMPDB, TETHER_PEER_KEY="mac")
+    env = dict(os.environ, TETHER_DB_PATH=TMPDB, TETHER_PEER_KEY="mac",
+               TETHER_NOTIFY_DISABLE="1")
     srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "tether_server.py"),
                             "--port", str(PORT)], env=env,
                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -83,6 +85,13 @@ def main():
         c.close()
         check("600 秒窗命中写入 dedup_log", n_log >= 1, n_log)
 
+        # 5b) P1-2 回归：先 auto-reply（600 秒），300 秒后同内容普通消息不能被长窗反向吞掉
+        r6 = post("反向吞用例 Z", auto_reply=True)
+        aged(seconds=300)
+        r7 = post("反向吞用例 Z", auto_reply=False)
+        check("长窗不反吞普通消息（auto-reply 后 300 秒，普通消息放行）",
+              "dropped" not in r6 and "dropped" not in r7, (r6, r7))
+
         # 6) 迁移前 /messages 不返回 ttl；迁移后返回
         m = get_messages()
         check("/messages 迁移前不含 ttl", all("ttl" not in x for x in m["messages"]), m["messages"][:1])
@@ -100,7 +109,11 @@ def main():
         os.environ["TETHER_DB_PATH"] = TMPDB
         os.environ["TETHER_AUTO_REPLY_HOURLY_CAP"] = "3"
         import tether_watcher as w
-        w._send_notification = lambda *a, **k: None      # 测试不发通知
+        # 断言：测试期间绝不能真的发网络通知（TETHER_NOTIFY_DISABLE 必须生效）
+        _orig_urlopen = w.urllib.request.urlopen
+        def _boom(*a, **k):
+            raise AssertionError("测试期间发生了网络通知调用")
+        w.urllib.request.urlopen = _boom
         allowed = []
         for _ in range(4):
             ok, n, cap = w._auto_reply_gate("mac")
@@ -113,6 +126,11 @@ def main():
         n = c.execute("SELECT COUNT(*) FROM auto_reply_log WHERE peer='mac'").fetchone()[0]
         c.close()
         check("成本闸计数落库（跨重启保持）", n >= 3, n)
+        w.urllib.request.urlopen = _orig_urlopen
+        # 非法上限不能把闸门关死
+        os.environ["TETHER_AUTO_REPLY_HOURLY_CAP"] = "abc"
+        ok_bad, n_bad, cap_bad = w._auto_reply_gate("mac")
+        check("非法 cap 仍放行且回退 30", cap_bad == 30, cap_bad)
         os.environ["TETHER_AUTO_REPLY_HOURLY_CAP"] = "30"
     finally:
         srv.terminate()

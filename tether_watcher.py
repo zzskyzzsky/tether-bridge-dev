@@ -904,6 +904,11 @@ def _send_notification(content):
     """
     if not content:
         return
+    # 测试/演练必须能被关掉：否则跑一次 cap 用例就会真发到主人通道（已发生过）
+    if os.environ.get("TETHER_NOTIFY_DISABLE", "").strip() in ("1", "true", "yes"):
+        log("🔇 TETHER_NOTIFY_DISABLE=1 → 通知被抑制（内容已写日志）")
+        _write_report_to_file(content)
+        return
     if not NOTIFY_WEBHOOK_URL:
         log("⚠️ NOTIFY_WEBHOOK_URL 未配置，跳过通知")
         _write_report_to_file(content)
@@ -1060,7 +1065,14 @@ def _auto_reply_gate(peer_key):
     返回 (allowed, count, cap)。
     """
     import sqlite3
-    cap = int(os.environ.get("TETHER_AUTO_REPLY_HOURLY_CAP", "30"))
+    # 非法值不能把闸门关死（"abc" 抛 ValueError、"0"/"-5" 永久拦死），一律 clamp
+    try:
+        cap = int(str(os.environ.get("TETHER_AUTO_REPLY_HOURLY_CAP", "30")).strip())
+    except ValueError:
+        cap = 30
+    if cap < 1:
+        log(f"⚠️ TETHER_AUTO_REPLY_HOURLY_CAP={cap} 非法，回退 30")
+        cap = 30
     now = time.time()
     db_path = os.environ.get("TETHER_DB_PATH") or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "tether.db")
@@ -1084,11 +1096,13 @@ def _auto_reply_gate(peer_key):
             conn.commit()
             conn.close()
             _send_notification(
-                f"[tp] tether auto-reply 触顶：对端 {peer_key} 近 1 小时已发 {n} 条"
+                # 首行标识用本机身份，不写死 [tp]：共享脚本在 mac 侧触发时得显示 mac
+                f"[{os.environ.get('TETHER_SENDER_NICK') or os.uname().nodename}] "
+                f"tether auto-reply 触顶：对端 {peer_key} 近 1 小时已发 {n} 条"
                 f"（上限 {cap}），本小时不再自动回复对端。\n"
                 "含义：要么确有大量实质往返，要么出现了措辞每轮不同的回声链。\n"
                 "需要你做的：无（下一小时自动恢复）；若确认是死循环，回一句我就把上限降到 6。")
-            log(f"🛑 auto-reply 触顶：peer={peer_key} count={n} cap={cap}，已通知主人")
+            log(f"🛑 auto-reply 触顶：peer={peer_key} count={n} cap={cap}（通知见上条，可能被抑制）")
             return False, n, cap
         conn.commit()
         conn.close()
@@ -1185,7 +1199,8 @@ def _auto_reply(output, sender_info, original_msg_id=None):
     DEDUP_SECONDS = 30
     try:
         import sqlite3
-        _db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
+        _db_path = os.environ.get("TETHER_DB_PATH") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tether.db")
         _conn = sqlite3.connect(_db_path, timeout=3)
         _cur = _conn.execute(
             "SELECT COUNT(*) FROM outgoing_messages "
