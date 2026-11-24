@@ -5,6 +5,7 @@ Tether Server v3 — 极简消息中转
 支持 type=handoff 消息：存 SQLite + 写 handoff 文件，但不触发 Watcher。
 """
 import json, os, socket, sqlite3, time, uuid
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
@@ -39,6 +40,18 @@ def _db():
         sent_at TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0
     )""")
     return conn
+
+@contextmanager
+def _db_conn():
+    """Open → yield → commit/rollback → **close**.
+
+    `with sqlite3.connect(...) as conn` only manages the transaction; the connection
+    itself survives until GC, and CPython's sqlite3 connections sit in reference cycles
+    that a GC pass does not reliably collect. Leaked handles pin a read snapshot, so WAL
+    never checkpoints and the file grows until the process hits EMFILE.
+    """
+    with closing(_db()) as conn, conn:
+        yield conn
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -77,7 +90,7 @@ def status():
     except Exception:
         pass
 
-    with _db() as conn:
+    with _db_conn() as conn:
         pending = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0 AND type='info'").fetchone()[0]
         unacked = conn.execute("SELECT COUNT(*) FROM outgoing_messages WHERE acked=0").fetchone()[0]
     return jsonify({
@@ -99,7 +112,7 @@ def receive():
         return jsonify({"status": "ok", "dropped": "empty"})
 
     msg_id = str(uuid.uuid4())
-    with _db() as conn:
+    with _db_conn() as conn:
         conn.execute(
             "INSERT INTO messages (id, sender, message, received_at, type, acked) VALUES (?,?,?,?,?,0)",
             (msg_id, sender, content, _now(), msg_type))
@@ -107,12 +120,12 @@ def receive():
     # 统一处理 in_reply_to（无论消息类型，自动确认对方的出站消息）
     in_reply_to = data.get("in_reply_to")
     if in_reply_to:
-        with _db() as conn:
+        with _db_conn() as conn:
             conn.execute("UPDATE outgoing_messages SET acked=1 WHERE id=?", (in_reply_to,))
 
     if msg_type == "auto_reply":
         # auto_reply：旧格式立即 acked，仅审计轨迹，不触发 watcher
-        with _db() as conn:
+        with _db_conn() as conn:
             conn.execute("UPDATE messages SET acked=1 WHERE id=?", (msg_id,))
     elif msg_type == "handoff":
         # handoff：存 SQLite + 写 handoff 文件，不触发 Watcher notify
@@ -131,7 +144,7 @@ def receive():
             pass
     else:
         # info 消息：正常触发 Watcher
-        with _db() as conn:
+        with _db_conn() as conn:
             cnt = conn.execute("SELECT COUNT(*) FROM messages WHERE acked=0 AND type='info'").fetchone()[0]
         _write_notify(content, cnt)
     return jsonify({"status": "ok", "message_id": msg_id})
@@ -140,7 +153,7 @@ def receive():
 def get_messages():
     auto_ack = request.args.get("ack", "1") == "1"
     msg_type = request.args.get("type", "info")  # 默认只返回 info 消息，传 all 返回全部
-    with _db() as conn:
+    with _db_conn() as conn:
         if msg_type == "all":
             rows = conn.execute(
                 "SELECT id,sender,message,type,received_at FROM messages WHERE acked=0"
@@ -162,7 +175,7 @@ def ack():
     data = request.get_json(silent=True) or {}
     msg_ids = data.get("message_ids", [])
     if msg_ids:
-        with _db() as conn:
+        with _db_conn() as conn:
             conn.execute(f"UPDATE outgoing_messages SET acked=1 WHERE id IN ({','.join('?' for _ in msg_ids)})", msg_ids)
     return jsonify({"status": "ok", "acked": len(msg_ids)})
 
@@ -170,7 +183,7 @@ def ack():
 @app.route("/pending", methods=["GET"])
 def pending_outgoing():
     """返回本机已发送但尚未被对方 ack 的消息列表"""
-    with _db() as conn:
+    with _db_conn() as conn:
         rows = conn.execute(
             "SELECT id, target_host, sender, message, sent_at, acked FROM outgoing_messages WHERE acked=0 ORDER BY sent_at DESC"
         ).fetchall()
@@ -185,7 +198,7 @@ def main():
     args = parser.parse_args()
     LISTEN_PORT = args.port
 
-    with _db() as conn:
+    with _db_conn() as conn:
         pass  # init tables
 
     print(f"🌉 Tether v3 — {HOSTNAME} :{LISTEN_PORT}")
