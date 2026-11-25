@@ -1,14 +1,19 @@
 """tether_web /api/clear 防回声回归（2026-11-25 无限互清事故）。
 
-契约：带 X-Tether-Clear-Forward 头（对端发起）→ 只清本地、不再回传；
-      无头（本端发起）→ 清本地 + 向对端转发恰好 1 次且带该头。
+契约（入口三态）：
+  1) 带 X-Tether-Clear-Forward 头（对端发起）→ 只清本地、不再回传；
+  2) 带 ?relay=1（同上，手工 curl 用）→ 只清本地、不再回传；
+  3) 无标记（本端发起）→ 清本地 + 向对端转发恰好 1 次且带标记头。
+另断言：转发失败不被静默吞掉（要打出日志），且本端仍返回 200/已清空。
 不触网、不动生产库：临时 DB + 本地假对端。
 """
+import io
 import os
 import sqlite3
 import sys
 import threading
 import tempfile
+import contextlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -67,23 +72,37 @@ def main():
         c.close()
         return m, o
 
-    try:
-        # 1) 对端发起（带头）→ 本地清空、0 次回传
+    def case(name, expect_hits, expect_codes, call, check_hdr=False):
+        nonlocal ok
         reset()
         _FakePeer.hits.clear()
-        r = client.post("/api/clear", headers={"X-Tether-Clear-Forward": "1"})
-        cond = r.status_code == 200 and not _FakePeer.hits and counts() == (0, 0)
-        print(("PASS" if cond else "FAIL"), "带头请求只清本地：转发", len(_FakePeer.hits), "次，剩余", counts())
-        ok &= cond
+        r = call()
+        cond = (r.status_code == 200 and len(_FakePeer.hits) == expect_hits
+                and counts() == (0, 0) and r.get_json().get("status") == "ok")
+        if check_hdr:
+            cond = cond and _FakePeer.hits[0]["hdr"] == "1"
+        print(("PASS" if cond else "FAIL"), name, "| 转发", len(_FakePeer.hits),
+              "次 | 剩余", counts(), "| 返回", r.get_json().get("message"))
+        ok = ok and cond
 
-        # 2) 本端发起（无头）→ 本地清空 + 转发 1 次且带标记头
+    try:
+        case("带头（对端发起）只清本地",
+             0, None, lambda: client.post("/api/clear", headers={"X-Tether-Clear-Forward": "1"}))
+        case("?relay=1（对端发起）只清本地",
+             0, None, lambda: client.post("/api/clear?relay=1"))
+        case("无标记（本端发起）转发 1 次且带标记头",
+             1, None, lambda: client.post("/api/clear"), check_hdr=True)
+
+        # 4) 转发失败：必须打日志、本端仍返回成功
         reset()
-        _FakePeer.hits.clear()
-        r = client.post("/api/clear")
-        cond = (r.status_code == 200 and len(_FakePeer.hits) == 1
-                and _FakePeer.hits[0]["hdr"] == "1" and counts() == (0, 0))
-        print(("PASS" if cond else "FAIL"), "无头请求转发恰好 1 次且带防回声头：", _FakePeer.hits)
-        ok &= cond
+        tw._peer_web_url = lambda: "http://127.0.0.1:1"  # 必然拒绝连接
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r = client.post("/api/clear")
+        out = buf.getvalue()
+        cond = (r.status_code == 200 and "[clear] 转发对端失败" in out and counts() == (0, 0))
+        print(("PASS" if cond else "FAIL"), "转发失败打日志不静默", "| 输出:", out.strip()[:60])
+        ok = ok and cond
     finally:
         tw.DB_PATH, tw._peer_web_url = orig_db, orig_peer
         srv.shutdown()
