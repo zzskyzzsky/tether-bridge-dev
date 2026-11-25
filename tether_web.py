@@ -23,6 +23,8 @@ LOCAL_NAME = _HOST_MAP.get(HOSTNAME, HOSTNAME)
 PEER_NAME = "tp" if LOCAL_NAME == "mac" else "mac"
 RELAY_NAMES = {"relay", "154.8.143.218"}
 PEER_WEB_URL_ENV = os.environ.get("TETHER_WEB_PEER_URL", "")
+# 走直连：Clash 对 100.x 目标返 502，而 urllib 的 no_proxy 不认 100.64.0.0/10 这种 CIDR
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _peer_web_url():
@@ -171,7 +173,7 @@ def _collect_messages(no_peer=False):
     if peer_url and not no_peer:
         try:
             req = urllib.request.Request(f"{peer_url}/api/messages?no_peer=1")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _DIRECT_OPENER.open(req, timeout=5) as resp:
                 peer_data = json.loads(resp.read().decode())
             local_keys = {(r["message"][:100], r["time"]) for r in results}
             for pm in peer_data.get("messages", []):
@@ -234,7 +236,7 @@ def clear_messages():
         if peer_url:
             try:
                 req = urllib.request.Request(f"{peer_url}/api/clear", method="POST")
-                urllib.request.urlopen(req, timeout=10)
+                _DIRECT_OPENER.open(req, timeout=10)
             except Exception:
                 pass
         return jsonify({"status": "ok", "message": "所有消息已清空"})
