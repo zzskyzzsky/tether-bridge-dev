@@ -231,11 +231,18 @@ def clear_messages():
         _execute("DELETE FROM messages")
         _execute("DELETE FROM outgoing_messages")
         _execute("VACUUM")
-        # 同时清空对端
+        # 同时清空对端。
+        # 防回声（2026-11-25 实测故障）：对端收到 clear 也会再转发回来，若不加标记，
+        # 两端会无限互清——tp/mac 实测每秒 1-2 次 POST 持续数分钟，消息表永远是 0。
+        # 转发请求带 X-Tether-Clear-Forward，收到该头的只清本地、不再回传，环即断开。
+        if request.headers.get("X-Tether-Clear-Forward"):
+            return jsonify({"status": "ok", "message": "本端已清空（对端发起）"})
         peer_url = _peer_web_url()
         if peer_url:
             try:
-                req = urllib.request.Request(f"{peer_url}/api/clear", method="POST")
+                req = urllib.request.Request(
+                    f"{peer_url}/api/clear", method="POST",
+                    headers={"X-Tether-Clear-Forward": "1"})
                 _DIRECT_OPENER.open(req, timeout=10)
             except Exception:
                 pass
