@@ -230,12 +230,14 @@ def clear_messages():
     try:
         _execute("DELETE FROM messages")
         _execute("DELETE FROM outgoing_messages")
-        _execute("VACUUM")
+        # VACUUM 需要独占锁：在请求线程里对正被 watcher 写着的库执行，会阻塞写入，
+        # 表现为 watcher 端"Tether 不可达"（mac review 2026-11-25）。空间回收交给
+        # 日常维护，不放在 clear 热路径上。
         # 同时清空对端。
         # 防回声（2026-11-25 实测故障）：对端收到 clear 也会再转发回来，若不加标记，
         # 两端会无限互清——tp/mac 实测每秒 1-2 次 POST 持续数分钟，消息表永远是 0。
-        # 转发请求带 X-Tether-Clear-Forward，收到该头的只清本地、不再回传，环即断开。
-        if request.headers.get("X-Tether-Clear-Forward"):
+        # 转发请求带 X-Tether-Clear-Forward（或 ?relay=1），收到的一方只清本地、不再回传。
+        if request.headers.get("X-Tether-Clear-Forward") or request.args.get("relay") == "1":
             return jsonify({"status": "ok", "message": "本端已清空（对端发起）"})
         peer_url = _peer_web_url()
         if peer_url:
@@ -244,8 +246,9 @@ def clear_messages():
                     f"{peer_url}/api/clear", method="POST",
                     headers={"X-Tether-Clear-Forward": "1"})
                 _DIRECT_OPENER.open(req, timeout=10)
-            except Exception:
-                pass
+            except Exception as e:
+                # 静默吞掉会让"对端其实没清"和"网络不通"完全不可见（本次风暴就是被它掩盖的）
+                print(f"[clear] 转发对端失败（本端已清，对端未清）：{e}", flush=True)
         return jsonify({"status": "ok", "message": "所有消息已清空"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
