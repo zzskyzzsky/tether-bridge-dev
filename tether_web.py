@@ -3,9 +3,12 @@
 
 纯只读（除 /api/clear 外），不修改任何已有代码。
 """
-import json, os, socket, sqlite3, subprocess, urllib.request
+import json, os, socket, sqlite3, subprocess, sys, urllib.request
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, send_file
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tether_net  # noqa: E402  主机名→Tailscale IP（MagicDNS 已失效）
 
 app = Flask(__name__)
 
@@ -19,7 +22,12 @@ _HOST_MAP = {"zzsky-mbp": "mac", "zzskytpg3": "tp"}
 LOCAL_NAME = _HOST_MAP.get(HOSTNAME, HOSTNAME)
 PEER_NAME = "tp" if LOCAL_NAME == "mac" else "mac"
 RELAY_NAMES = {"relay", "154.8.143.218"}
-PEER_WEB_URL = os.environ.get("TETHER_WEB_PEER_URL", "")
+PEER_WEB_URL_ENV = os.environ.get("TETHER_WEB_PEER_URL", "")
+
+
+def _peer_web_url():
+    """对端 web 基址。主机名每次解析（tether_net 内 60s 缓存），节点换 IP 后自愈。"""
+    return tether_net.resolve_url(PEER_WEB_URL_ENV) if PEER_WEB_URL_ENV else ""
 RELAY_HOST = "154.8.143.218"
 
 _TAILSCALE_PEERS_CACHE = None
@@ -159,9 +167,10 @@ def _collect_messages(no_peer=False):
             continue
         results.append({"id": m["id"], "dir": "out", "from": frm, "to": to, "route": route, "via_relay": via_relay, "time": m["time"], "time_bj": _fmt_bj(m["time"]), "type": "info", "message": m["message"], "source": "local", "direction": _direction(frm, to)})
 
-    if PEER_WEB_URL and not no_peer:
+    peer_url = _peer_web_url()
+    if peer_url and not no_peer:
         try:
-            req = urllib.request.Request(f"{PEER_WEB_URL}/api/messages?no_peer=1")
+            req = urllib.request.Request(f"{peer_url}/api/messages?no_peer=1")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 peer_data = json.loads(resp.read().decode())
             local_keys = {(r["message"][:100], r["time"]) for r in results}
@@ -221,9 +230,10 @@ def clear_messages():
         _execute("DELETE FROM outgoing_messages")
         _execute("VACUUM")
         # 同时清空对端
-        if PEER_WEB_URL:
+        peer_url = _peer_web_url()
+        if peer_url:
             try:
-                req = urllib.request.Request(f"{PEER_WEB_URL}/api/clear", method="POST")
+                req = urllib.request.Request(f"{peer_url}/api/clear", method="POST")
                 urllib.request.urlopen(req, timeout=10)
             except Exception:
                 pass

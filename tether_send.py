@@ -26,6 +26,9 @@ import sys
 import uuid
 import urllib.request
 import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tether_net  # noqa: E402  主机名→Tailscale IP（不依赖 DNS/MagicDNS）
 from datetime import datetime, timezone
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tether.db")
@@ -181,6 +184,9 @@ def send(host: str, msg_type: str, message: str, port: int | None = None, nick: 
             port = DEFAULT_PORT
     else:
         target_host = host
+
+    # 主机名 → Tailscale IP（MagicDNS 已失效；已是 IP 则原样返回）
+    target_host = tether_net.resolve_peer(target_host)
 
     # --nick 覆盖默认昵称
     sender_nick = nick or SENDER_NICK

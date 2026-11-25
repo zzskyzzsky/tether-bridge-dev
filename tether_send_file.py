@@ -12,8 +12,11 @@ Tether File Send — 通过 scp/rsync + Tether 控制消息传输文件/目录
 import argparse, hashlib, json, os, socket, subprocess, sys, time, urllib.request
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tether_net  # noqa: E402  主机名→Tailscale IP（MagicDNS 已失效）
+
 TETHER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9003"))
-RELAY_HOST = os.environ.get("TETHER_PEER_HOST", "")
+RELAY_HOST = tether_net.resolve_peer(os.environ.get("TETHER_PEER_HOST", ""))
 LOCAL_HOSTNAME = socket.gethostname()
 SENDER_NICK = os.environ.get("TETHER_SENDER_NICK", LOCAL_HOSTNAME)
 SSH_USER = os.environ.get("TETHER_SSH_USER", os.environ.get("USER", "zzsky"))
@@ -29,7 +32,7 @@ def log(msg):
 
 def _resolve_host(host):
     if host:
-        return host
+        return tether_net.resolve_peer(host)
     if RELAY_HOST:
         return RELAY_HOST
     log("❌ 未指定 --host 且 TETHER_PEER_HOST 未设置")

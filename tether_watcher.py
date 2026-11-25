@@ -6,7 +6,7 @@ Tether Watcher — 事件驱动消息处理器
 
 独立于 tether_server.py 运行，没有耦合。
 """
-import json, os, resource, subprocess, threading, time, urllib.error, urllib.request, uuid
+import json, os, resource, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
 from datetime import datetime, timezone
 
 # 设置本机请求绕过 HTTP 代理（MacBook 上可能配了 Clash 环境变量）
@@ -32,9 +32,12 @@ HANDOFF_RESULT_FILE = "/tmp/tether_handoff_result.json"
 POLL_INTERVAL = 2
 
 # 同行 Tether 地址（对方 Hermes 实例，用于自动回复）
-PEER_HOST = os.environ.get("TETHER_PEER_HOST", "")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tether_net  # noqa: E402  主机名→Tailscale IP（MagicDNS 已失效，见 tether_net 文档）
+
+PEER_HOST = tether_net.resolve_peer(os.environ.get("TETHER_PEER_HOST", ""))
 PEER_PORT = int(os.environ.get("TETHER_PEER_PORT", "9003"))
-PEER_FALLBACK_HOST = os.environ.get("TETHER_PEER_FALLBACK_HOST", "")
+PEER_FALLBACK_HOST = tether_net.resolve_peer(os.environ.get("TETHER_PEER_FALLBACK_HOST", ""))
 TETHER_URL = f"http://127.0.0.1:{PEER_PORT}"
 
 # host -> 短名映射（target_nick：mac/tp）
@@ -1161,7 +1164,7 @@ def _auto_reply(output, sender_info, original_msg_id=None):
     # 2026-09-01 修复保留（当时 mac 解析不了 zzskytpg3 → auto-reply 全部 DNS 失败）。
     # 2026-09-10 MagicDNS 短名已修好（Clash hosts + ts.net 解析策略），但 IP 直连更稳，
     # 仍以环境变量优先；未设置时回退 sender_info 主机名（见下方兜底分支）。
-    target_host = os.environ.get("TETHER_PEER_HOST", "").strip()
+    target_host = tether_net.resolve_peer(os.environ.get("TETHER_PEER_HOST", "").strip())
     if not target_host or target_host in ("unknown",):
         # 环境变量未设置时，从 sender 提取主机名兜底
         target_host = sender_info.split()[0] if sender_info else ""
@@ -1171,7 +1174,7 @@ def _auto_reply(output, sender_info, original_msg_id=None):
 
     # 检查 target_host 是否含非 ASCII 字符（如纯中文昵称），有则回退到 PEER_HOST
     if any(ord(c) > 127 for c in target_host):
-        fallback = os.environ.get("TETHER_PEER_HOST", "")
+        fallback = tether_net.resolve_peer(os.environ.get("TETHER_PEER_HOST", ""))
         if fallback and fallback != target_host:
             log(f"⏭ target_host 含非 ASCII 字符 ({target_host})，回退到 TETHER_PEER_HOST={fallback}")
             target_host = fallback
@@ -1413,7 +1416,7 @@ def _file_xfer_respond(sender, action, name, reason="", detail="", computed_sha2
     # 从 sender 提取目标主机
     target_host = sender.split()[0] if sender else ""
     if not target_host or target_host in ("unknown",):
-        target_host = os.environ.get("TETHER_PEER_HOST", "")
+        target_host = tether_net.resolve_peer(os.environ.get("TETHER_PEER_HOST", ""))
     if not target_host:
         log("⚠️ 无法确定回复目标")
         return
@@ -2133,7 +2136,7 @@ def _validate_env():
     if not PEER_HOST:
         log("⚠️ TETHER_PEER_HOST 未设置 → auto-reply 不会自动回复，需手动发送")
     else:
-        log(f"✅ TETHER_PEER_HOST={PEER_HOST}")
+        log(f"✅ TETHER_PEER_HOST={tether_net.for_log(os.environ.get('TETHER_PEER_HOST', ''))}")
 
     sender_nick = os.environ.get("TETHER_SENDER_NICK", "")
     if not sender_nick:
